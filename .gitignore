@@ -1,1 +1,50 @@
-Nothing should be ignored based on the provided file changes, as they only include source files (.md and .java) without any build artifacts, dependencies, or temporary files.
+```
+# Compiled and binary files
+*.class
+*.pyc
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.out
+
+# Dependencies
+node_modules/
+venv/
+.venv/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+target/
+.gradle/
+
+# Build artifacts
+dist/
+build/
+
+# Editors/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+
+# Logs
+*.log
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# System
+.DS_Store
+Thumbs.db
+```
