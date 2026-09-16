@@ -1,0 +1,417 @@
+/*
+ *  Copyright (c) 2026 Siemens AG
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License"); you may
+ *  not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ *  WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ *  SPDX-License-Identifier: Apache-2.0
+ */
+package com.siemens.pki.cmpracomponent.persistency;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.siemens.pki.cmpracomponent.msgvalidation.BaseCmpException;
+import com.siemens.pki.cmpracomponent.msgvalidation.CmpProcessingException;
+import java.io.IOException;
+import java.security.PrivateKey;
+import java.time.Instant;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import org.bouncycastle.asn1.ASN1OctetString;
+import org.bouncycastle.asn1.cmp.CMPCertificate;
+import org.bouncycastle.asn1.cmp.PKIFailureInfo;
+import org.bouncycastle.asn1.cmp.PKIMessage;
+import org.bouncycastle.operator.OperatorCreationException;
+
+/**
+ * holder for all persistent data
+ */
+public class PersistencyContext {
+
+    @JsonIgnore
+    private final TransactionStateTracker transactionStateTracker = new TransactionStateTracker(this);
+
+    private Instant expirationTime;
+    private byte[] transactionId;
+    private String certProfile;
+    private PrivateKey newGeneratedPrivateKey;
+
+    private Set<CMPCertificate> alreadySentExtraCertsToUpStream;
+    private Set<CMPCertificate> alreadySentExtraCertsToDownStream;
+
+    private PKIMessage delayedInitialRequest;
+    private PKIMessage pendingDelayedResponse;
+    private LastTransactionState lastTransactionState;
+    private ASN1OctetString lastSenderNonce;
+    private CMPCertificate enrolledCertificate;
+    private boolean implicitConfirmGranted;
+    private byte[] requestedPublicKey;
+
+    @JsonIgnore
+    private List<CMPCertificate> issuingChain;
+
+    @JsonIgnore
+    private PersistencyContextManager contextManager;
+
+    private int certificateRequestType;
+
+    private boolean respondedCertMustBeEncrypted;
+
+    /**
+     * ctor used by jackson
+     */
+    public PersistencyContext() {}
+
+    /**
+     * ctor
+     * @param contextManager contextManager in charge
+     * @param transactionId transactionId belonging to this PersistencyContext
+     */
+    PersistencyContext(final PersistencyContextManager contextManager, final byte[] transactionId) {
+        this.transactionId = transactionId;
+        this.contextManager = contextManager;
+        lastTransactionState = LastTransactionState.INITIAL_STATE;
+        this.certificateRequestType = -1;
+        this.respondedCertMustBeEncrypted = false;
+    }
+
+    /**
+     * store or clear persistent state
+     * @throws IOException in case of error
+     */
+    public void flush() throws IOException {
+        if (transactionStateTracker.isTransactionTerminated()) {
+            contextManager.clearPersistencyContext(transactionId);
+        } else {
+            contextManager.flushPersistencyContext(this);
+        }
+    }
+
+    /**
+     * get certificate profile used in transaction
+     * @return certificate profile or <code>null</code>
+     */
+    public String getCertProfile() {
+        return certProfile;
+    }
+
+    /**
+     * is the transaction delayed (polling)?
+     * @return true if delayed
+     */
+    @JsonIgnore
+    public boolean isDelayedDeliveryInProgress() {
+        return delayedInitialRequest != null;
+    }
+
+    /**
+     * get certificate to confirm
+     * @return certificate digest or <code>null</code>
+     */
+    public CMPCertificate getEnrolledCertificate() {
+        return enrolledCertificate;
+    }
+
+    /**
+     * get expiration time for related transaction
+     * @return expiration time
+     */
+    public Instant getExpirationTime() {
+        return expirationTime;
+    }
+
+    /**
+     * get first request of the transaction
+     * @return first request
+     */
+    public PKIMessage getDelayedInitialRequest() {
+        return delayedInitialRequest;
+    }
+
+    /**
+     * get issueing chain
+     * @return issueing chain
+     */
+    public List<CMPCertificate> getIssuingChain() {
+        return issuingChain;
+    }
+
+    /**
+     * get last used sender nonce
+     * @return last used sender nonce
+     */
+    public ASN1OctetString getLastSenderNonce() {
+        return lastSenderNonce;
+    }
+
+    /**
+     * get last state of transaction
+     * @return last state of transaction
+     */
+    public LastTransactionState getLastTransactionState() {
+        return lastTransactionState;
+    }
+
+    /**
+     * get central generated private key
+     * @return  private key or <code>null</code>
+     */
+    public PrivateKey getNewGeneratedPrivateKey() {
+        return newGeneratedPrivateKey;
+    }
+
+    /**
+     * get pending upstream response in case of deöayed delivery
+     * @return upstream response
+     */
+    public PKIMessage getPendingDelayedResponse() {
+        return pendingDelayedResponse;
+    }
+
+    /**
+     * get public key in CRMF template
+     * @return public key
+     */
+    public byte[] getRequestedPublicKey() {
+        return requestedPublicKey;
+    }
+
+    /**
+     * get type of initial request
+     * @return type of initial request
+     */
+    public int getRequestType() {
+        return certificateRequestType;
+    }
+
+    /**
+     * get TransactionId
+     * @return TransactionId
+     */
+    public byte[] getTransactionId() {
+        return transactionId;
+    }
+
+    /**
+     * ImplicitConfirm used in transaction
+     * @return true if ImplicitConfirm is used
+     */
+    public boolean isImplicitConfirmGranted() {
+        return implicitConfirmGranted;
+    }
+
+    /**
+     * set certificate profile
+     * @param certProfile certificate profile or <code>null</code> if certificate profile should not change
+     */
+    public void setCertProfile(final String certProfile) {
+        if (certProfile != null) {
+            this.certProfile = certProfile;
+        }
+    }
+
+    /**
+     * set contextManager
+     * @param contextManager the contextManager
+     */
+    public void setContextManager(final PersistencyContextManager contextManager) {
+        this.contextManager = contextManager;
+    }
+
+    /**
+     * set enrolledCertificate
+     * @param enrolledCertificate the enrolledCertificate
+     */
+    public void setEnrolledCertficate(final CMPCertificate enrolledCertificate) {
+        this.enrolledCertificate = enrolledCertificate;
+    }
+
+    /**
+     * set transaction expiration time
+     * @param expirationTime transaction expiration time
+     */
+    public void setExpirationTime(final Instant expirationTime) {
+        this.expirationTime = expirationTime;
+    }
+
+    /**
+     * set implicitConfirmGranted
+     * @param implicitConfirmGranted true if implict confirm used
+     */
+    public void setImplicitConfirmGranted(final boolean implicitConfirmGranted) {
+        this.implicitConfirmGranted = implicitConfirmGranted;
+    }
+
+    /**
+     * mark transaction as delayed delivery, store initial request
+     * @param delayedInitialRequest the initial request triggering delayed delivery
+     */
+    public void setDelayedInitialRequest(final PKIMessage delayedInitialRequest) {
+        if (this.delayedInitialRequest == null) {
+            this.delayedInitialRequest = delayedInitialRequest;
+        }
+    }
+
+    /**
+     * set issuingChain
+     * @param issuingChain the issuingChain
+     */
+    public void setIssuingChain(final List<CMPCertificate> issuingChain) {
+        this.issuingChain = issuingChain;
+    }
+
+    /**
+     * set lastSenderNonce
+     * @param asn1OctetString the lastSenderNonce
+     */
+    public void setLastSenderNonce(final ASN1OctetString asn1OctetString) {
+        this.lastSenderNonce = asn1OctetString;
+    }
+
+    /**
+     * set lastTransactionState
+     * @param lastTransactionState the lastTransactionState
+     */
+    public void setLastTransactionState(final LastTransactionState lastTransactionState) {
+        this.lastTransactionState = lastTransactionState;
+    }
+
+    /**
+     * set newGeneratedPrivateKey
+     * @param newGeneratedPrivateKey the newGeneratedPrivateKey
+     */
+    public void setNewGeneratedPrivateKey(final PrivateKey newGeneratedPrivateKey) {
+        this.newGeneratedPrivateKey = newGeneratedPrivateKey;
+    }
+
+    /**
+     * set pending delayed response from upstream
+     * @param delayedResponse the delayed response
+     * @throws CmpProcessingException in case of error
+     */
+    public void setPendingDelayedResponse(final PKIMessage delayedResponse) throws CmpProcessingException {
+        if (this.pendingDelayedResponse != null) {
+            throw new CmpProcessingException(
+                    "upstream persistency",
+                    PKIFailureInfo.transactionIdInUse,
+                    "duplicate response for same transactionID");
+        }
+        this.pendingDelayedResponse = delayedResponse;
+    }
+
+    /**
+     * set requestedPublicKey
+     * @param requestedPublicKey the requestedPublicKey
+     */
+    public void setRequestedPublicKey(final byte[] requestedPublicKey) {
+        this.requestedPublicKey = requestedPublicKey;
+    }
+
+    /**
+     * set certificateRequestType
+     * @param certificateRequestType the certificateRequestType
+     */
+    public void setRequestType(final int certificateRequestType) {
+        this.certificateRequestType = certificateRequestType;
+    }
+
+    /**
+     * process an incoming message
+     * @param msg message to process
+     * @throws BaseCmpException in case of CMP relate error
+     * @throws IOException in case of general error
+     * @throws OperatorCreationException in case of certificate validation error
+     */
+    public void trackMessage(final PKIMessage msg) throws BaseCmpException, IOException, OperatorCreationException {
+        transactionStateTracker.trackMessage(msg);
+    }
+
+    /**
+     * update expirationTime
+     * @param expirationTime new expirationTime
+     */
+    public void updateTransactionExpirationTime(final Instant expirationTime) {
+        // only downstream can expire
+        this.expirationTime = expirationTime;
+    }
+
+    /**
+     * in case of indirect KEM POP the cert responded by RA must be encrypted. Enable it.
+     *
+     */
+    public void setRespondedCertMustBeEncrypted() {
+        respondedCertMustBeEncrypted = true;
+    }
+    /**
+     * in case of indirect KEM POP the cert responded by RA must be encrypted
+     * @return <code>true</code> if indirect KEM POP is used for enrollment
+     */
+    public boolean isRespondedCertMustBeEncrypted() {
+        return respondedCertMustBeEncrypted;
+    }
+
+    /**
+     * Returns the set of extraCerts already sent to the upstream peer for this
+     * transaction. The set is lazily initialized and mutable, allowing callers
+     * to add entries as certificates are sent upstream.
+     *
+     * @return a non-null mutable {@link Set} of upstream-known {@link CMPCertificate}s
+     */
+    public Set<CMPCertificate> getAlreadySentExtraCertsToUpStream() {
+        if (alreadySentExtraCertsToUpStream == null) {
+            alreadySentExtraCertsToUpStream = new HashSet<>();
+        }
+        return alreadySentExtraCertsToUpStream;
+    }
+
+    /**
+     * Replaces the set of extraCerts already sent to the upstream peer.
+     * A defensive copy is created to avoid external mutation of internal state.
+     * If {@code certsKnownToUpstream} is {@code null}, the internal set is reset
+     * to an empty set.
+     *
+     * @param certsKnownToUpstream the new upstream-known certificates, or {@code null}
+     *                             to reset the set to empty
+     */
+    public void setAlreadySentExtraCertsToUpStream(final Set<CMPCertificate> certsKnownToUpstream) {
+        this.alreadySentExtraCertsToUpStream =
+                (certsKnownToUpstream == null) ? new HashSet<>() : new HashSet<>(certsKnownToUpstream);
+    }
+
+    /**
+     * Returns the set of extraCerts already sent to the downstream peer for this
+     * transaction. The set is lazily initialized and mutable, allowing callers
+     * to add entries as certificates are sent downstream.
+     *
+     * @return a non-null mutable {@link Set} of downstream-known {@link CMPCertificate}s
+     */
+    public Set<CMPCertificate> getAlreadySentExtraCertsToDownStream() {
+        if (alreadySentExtraCertsToDownStream == null) {
+            alreadySentExtraCertsToDownStream = new HashSet<>();
+        }
+        return alreadySentExtraCertsToDownStream;
+    }
+
+    /**
+     * Replaces the set of extraCerts already sent to the downstream peer.
+     * A defensive copy is created to avoid external mutation of internal state.
+     * If {@code certsKnownToDownstream} is {@code null}, the internal set is reset
+     * to an empty set.
+     *
+     * @param certsKnownToDownstream the new downstream-known certificates, or
+     *                               {@code null} to reset the set to empty
+     */
+    public void setAlreadySentExtraCertsToDownStream(final Set<CMPCertificate> certsKnownToDownstream) {
+        this.alreadySentExtraCertsToDownStream =
+                (certsKnownToDownstream == null) ? new HashSet<>() : new HashSet<>(certsKnownToDownstream);
+    }
+}
