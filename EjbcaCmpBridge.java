@@ -2,151 +2,221 @@ import com.siemens.pki.cmpracomponent.configuration.*;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent.CmpRaInterface;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent.UpstreamExchange;
-import com.sun.net.httpserver.HttpServer;
+import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.security.cert.X509Certificate;
+import java.util.Collection;
 import java.util.Collections;
 
 /**
- * PoC: EJBCA CMP Bridge
+ * PoC: Bridge between OpenSSL CMP client and EJBCA CMP server.
  * 
- * ARCHITECTURE (Mode A - Pass Through):
- * [OpenSSL CMP] --(CMP Bytes)--> [Local HTTP Server] --(CMP Bytes)--> [EJBCA REST/CMP Endpoint]
+ * ARCHITECTURE (Mode A - Pass-Through):
+ * [OpenSSL CMP] --> [This Bridge (RA Component)] --> [EJBCA CMP Server]
  * 
- * This implementation uses the Siemens CMP RA Component to handle the heavy lifting
- * of CMP message parsing/validation, while simply forwarding the payload to EJBCA.
+ * The bridge accepts CMP messages on port 8080, forwards them to EJBCA via HTTP POST,
+ * and returns the response. All CMP protocol handling is done by the RA Component.
  * 
  * CONFIGURATION MAPPING (from CABackendParams-Kind-CMP.txt):
- * - CMP.EndpointAddress -> EJBCA_URL
- * - AuthenticationSharedSecret -> SHARED_SECRET
- * - CMP.HashAlgorithm -> SHA256 (Recommended over default SHA1)
- * - CMP.Dialect -> EJBCA
- * - CMP.ImplicitConfirm -> false
+ * - CMP.EndpointAddress -> ejbcaUrl (passed as argument)
+ * - AuthenticationSharedSecret -> sharedSecret (passed as argument)
+ * - CMP.Sender.KID -> senderKID (passed as argument)
+ * - CMP.HashAlgorithm -> SHA256 (configured below)
+ * - CMP.ImplicitConfirm -> false (configured below)
+ * - CMP.HashMinRounds -> 5000 (configured below)
+ * - CMP.HashSaltSize -> 32 (configured below)
  */
 public class EjbcaCmpBridge {
-
+    
+    private static final int DOWNSTREAM_PORT = 8080;
+    private static final String DOWNSTREAM_PATH = "/cmp";
+    
     private final String ejbcaUrl;
-    private final String sharedSecret;
-    private final String senderKid;
+    private final byte[] sharedSecret;
+    private final byte[] senderKID;
     private final CmpRaInterface raComponent;
     private final HttpClient httpClient;
 
-    public EjbcaCmpBridge(String ejbcaUrl, String sharedSecret, String senderKid) throws Exception {
-        this.ejbcaUrl = ejbcaUrl;
-        this.sharedSecret = sharedSecret;
-        this.senderKid = senderKid;
-        this.httpClient = HttpClient.newHttpClient();
-
-        // 1. Configure the RA Component for EJBCA
-        Configuration config = new SimpleConfiguration(sharedSecret, senderKid);
-
-        // 2. Implement the Upstream Exchange (The bridge to EJBCA)
-        UpstreamExchange upstream = new UpstreamExchange() {
-            @Override
-            public byte[] sendReceiveMessage(byte[] cmpRequest, String certProfile, int bodyType) throws Exception {
-                System.out.println("[UPSTREAM] Forwarding request to EJBCA: " + ejbcaUrl);
-                
-                HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(ejbcaUrl))
-                    .header("Content-Type", "application/pkixcmp")
-                    .POST(HttpRequest.BodyPublishers.ofByteArray(cmpRequest))
-                    .build();
-
-                HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
-
-                if (response.statusCode() != 200) {
-                    throw new IOException("EJBCA returned error code: " + response.statusCode());
-                }
-
-                System.out.println("[UPSTREAM] Received response from EJBCA (" + response.body().length + " bytes)");
-                return response.body();
-            }
-        };
-
-        // 3. Instantiate the RA Component
-        this.raComponent = CmpRaComponent.instantiateCmpRaComponent(config, upstream);
+    public static void main(String[] args) throws Exception {
+        if (args.length < 3) {
+            System.err.println("Usage: java EjbcaCmpBridge <ejbcaUrl> <sharedSecret> <senderKID>");
+            System.err.println("Example: java EjbcaCmpBridge http://localhost:8080/ejbca/publicweb/cmp/myalias mySecret myKeyId");
+            System.exit(1);
+        }
         
-        System.out.println("RA Component initialized successfully for EJBCA.");
+        String ejbcaUrl = args[0];
+        String sharedSecret = args[1];
+        String senderKID = args[2];
+        
+        EjbcaCmpBridge bridge = new EjbcaCmpBridge(ejbcaUrl, sharedSecret, senderKID);
+        bridge.start();
     }
 
-    /**
-     * Starts the local HTTP server that OpenSSL will talk to.
-     * Listens on localhost:8080 by default.
-     */
-    public void startServer(int port) throws IOException {
-        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+    public EjbcaCmpBridge(String ejbcaUrl, String sharedSecret, String senderKID) throws Exception {
+        this.ejbcaUrl = ejbcaUrl;
+        this.sharedSecret = sharedSecret.getBytes(StandardCharsets.UTF_8);
+        this.senderKID = senderKID.getBytes(StandardCharsets.UTF_8);
+        this.httpClient = HttpClient.newHttpClient();
         
-        server.createContext("/cmp", exchange -> {
-            System.out.println("\n[DOWNSTREAM] Received request from OpenSSL on port " + port);
-            
-            try (InputStream is = exchange.getRequestBody()) {
-                byte[] requestBytes = is.readAllBytes();
-                System.out.println("[DOWNSTREAM] Read " + requestBytes.length + " bytes from client.");
+        // Create configuration for EJBCA
+        Configuration config = new EjbcConfiguration();
+        
+        // Create upstream exchange that forwards to EJBCA
+        UpstreamExchange upstreamExchange = this::forwardToEjbca;
+        
+        // Initialize RA Component using the static factory method
+        this.raComponent = CmpRaComponent.instantiateCmpRaComponent(config, upstreamExchange);
+        
+        System.out.println("EJBCA CMP Bridge initialized");
+        System.out.println("  EJBCA URL: " + ejbcaUrl);
+        System.out.println("  Downstream port: " + DOWNSTREAM_PORT);
+        System.out.println("  Downstream path: " + DOWNSTREAM_PATH);
+        System.out.println("  Hash Algorithm: SHA256");
+        System.out.println("  Implicit Confirm: false");
+        System.out.println("  Hash Rounds: 5000");
+        System.out.println("  Salt Size: 32 bytes");
+    }
 
-                // Process using the RA Component (validates & forwards)
-                byte[] responseBytes = raComponent.processRequest(requestBytes);
-
-                exchange.getResponseHeaders().set("Content-Type", "application/pkixcmp");
-                exchange.sendResponseHeaders(200, responseBytes.length);
+    public void start() throws Exception {
+        // Simple HTTP server to accept CMP requests from OpenSSL
+        com.sun.net.httpserver.HttpServer server = com.sun.net.httpserver.HttpServer.create(
+            new java.net.InetSocketAddress(DOWNSTREAM_PORT), 0);
+        
+        server.createContext(DOWNSTREAM_PATH, exchange -> {
+            try {
+                // Read incoming CMP request
+                byte[] requestBytes = exchange.getRequestBody().readAllBytes();
+                System.out.println("Received CMP request: " + requestBytes.length + " bytes");
                 
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(responseBytes);
-                    System.out.println("[DOWNSTREAM] Sent " + responseBytes.length + " bytes back to client.");
-                }
+                // Process through RA Component
+                byte[] responseBytes = raComponent.processRequest(requestBytes);
+                
+                // Send response back
+                exchange.sendResponseHeaders(200, responseBytes.length);
+                exchange.getResponseBody().write(responseBytes);
+                exchange.close();
+                
+                System.out.println("Sent CMP response: " + responseBytes.length + " bytes");
             } catch (Exception e) {
+                System.err.println("Error processing request: " + e.getMessage());
                 e.printStackTrace();
                 exchange.sendResponseHeaders(500, -1);
+                exchange.close();
             }
         });
-
-        server.setExecutor(null); 
+        
+        server.setExecutor(null);
         server.start();
-        System.out.println("============================================");
-        System.out.println("EJBCA CMP Bridge Started!");
-        System.out.println("Listening on: http://localhost:" + port + "/cmp");
-        System.out.println("Forwarding to: " + ejbcaUrl);
-        System.out.println("============================================");
-    }
-
-    public static void main(String[] args) {
-        if (args.length < 2) {
-            System.out.println("Usage: java EjbcaCmpBridge <EJBCA_URL> <SHARED_SECRET> [SENDER_KID]");
-            System.out.println("Example: java EjbcaCmpBridge https://ejbca.test/ejbca/publicweb/cmp/myprofile mySecretPassword myKeyId");
-            System.exit(1);
-        }
-
-        String url = args[0];
-        String secret = args[1];
-        String kid = (args.length > 2) ? args[2] : null;
-
-        try {
-            EjbcaCmpBridge bridge = new EjbcaCmpBridge(url, secret, kid);
-            bridge.startServer(8080);
-        } catch (Exception e) {
-            e.printStackTrace();
-            System.exit(1);
-        }
+        
+        System.out.println("\nEJBCA CMP Bridge started on port " + DOWNSTREAM_PORT);
+        System.out.println("Ready to accept CMP requests at http://localhost:" + DOWNSTREAM_PORT + DOWNSTREAM_PATH);
+        System.out.println("\nExample OpenSSL commands:");
+        System.out.println("  # Initialize Request (IR):");
+        System.out.println("  openssl cmp -server http://localhost:" + DOWNSTREAM_PORT + DOWNSTREAM_PATH + " \\");
+        System.out.println("    -cacerts ejbca_ca.pem -certout cert.pem -keyout key.pem \\");
+        System.out.println("    -subject \"/CN=TestUser/O=MyOrg\" -ir \\");
+        System.out.println("    -secret " + new String(sharedSecret) + " -kid " + new String(senderKID) + " -digest sha256");
+        System.out.println("\n  # PKCS#10 Certificate Request (P10CR):");
+        System.out.println("  openssl cmp -server http://localhost:" + DOWNSTREAM_PORT + DOWNSTREAM_PATH + " \\");
+        System.out.println("    -cacerts ejbca_ca.pem -certout issued_cert.pem \\");
+        System.out.println("    -p10cr user.csr \\");
+        System.out.println("    -secret " + new String(sharedSecret) + " -kid " + new String(senderKID) + " -digest sha256");
     }
 
     /**
-     * Simple Configuration Implementation for EJBCA with Shared Secret
-     * Maps settings from CABackendParams-Kind-CMP.txt to the Configuration interface
+     * Forward CMP message to EJBCA via HTTP POST
      */
-    static class SimpleConfiguration implements Configuration {
-        private final byte[] sharedSecret;
-        private final String senderKid;
-
-        public SimpleConfiguration(String secret, String kid) {
-            this.sharedSecret = secret.getBytes();
-            this.senderKid = kid;
+    private byte[] forwardToEjbca(byte[] requestBytes, String certProfile, int bodyType) throws Exception {
+        System.out.println("Forwarding " + requestBytes.length + " bytes to EJBCA: " + ejbcaUrl + 
+                          " (bodyType=" + bodyType + ", certProfile=" + certProfile + ")");
+        
+        HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create(ejbcaUrl))
+            .header("Content-Type", "application/pkixcmp")
+            .POST(HttpRequest.BodyPublishers.ofByteArray(requestBytes))
+            .build();
+        
+        HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+        
+        int statusCode = response.statusCode();
+        byte[] responseBody = response.body();
+        
+        System.out.println("EJBCA response: status=" + statusCode + ", size=" + responseBody.length + " bytes");
+        
+        if (statusCode != 200) {
+            throw new IOException("EJBCA returned status code: " + statusCode);
         }
+        
+        return responseBody;
+    }
+
+    /**
+     * Configuration implementation for EJBCA based on CABackendParams-Kind-CMP.txt
+     */
+    class EjbcConfiguration implements Configuration {
+        
+        // Shared secret credential context for MAC protection (upstream to EJBCA)
+        private final SharedSecretCredentialContext upstreamCredentials = new SharedSecretCredentialContext() {
+            @Override
+            public byte[] getSharedSecret() {
+                return sharedSecret;
+            }
+            
+            @Override
+            public byte[] getSenderKID() {
+                return senderKID;
+            }
+            
+            @Override
+            public String getMacAlgorithm() {
+                // Use HMAC-SHA256 as per CMP.HashAlgorithm: SHA256
+                return PKCSObjectIdentifiers.id_hmacWithSHA256.getId();
+            }
+            
+            @Override
+            public String getPasswordBasedMacAlgorithm() {
+                return "PBMAC1";
+            }
+            
+            @Override
+            public String getPrf() {
+                return "SHA256";
+            }
+            
+            @Override
+            public int getIterationCount() {
+                // From CMP.HashMinRounds: 5000
+                return 5000;
+            }
+            
+            @Override
+            public byte[] getSalt() {
+                // From CMP.HashSaltSize: 32
+                return new byte[32];
+            }
+        };
+        
+        // Verification context for downstream (accept MAC from OpenSSL clients)
+        private final VerificationContext downstreamVerification = new VerificationContext() {
+            @Override
+            public byte[] getSharedSecret(byte[] senderKID) {
+                // Accept the same shared secret from all clients
+                // In production, you might want to look up different secrets per KID
+                return sharedSecret;
+            }
+            
+            @Override
+            public Collection<X509Certificate> getTrustedCertificates() {
+                // Optionally add CA certificates for signature verification
+                return Collections.emptyList();
+            }
+        };
 
         @Override
         public CkgContext getCkgConfiguration(String certProfile, int bodyType) {
@@ -157,77 +227,55 @@ public class EjbcaCmpBridge {
         public CmpMessageInterface getDownstreamConfiguration(String certProfile, int bodyType) {
             return new CmpMessageInterface() {
                 @Override
-                public ProtectionMode getProtectionMode() {
-                    // Use MAC (shared secret) for downstream
-                    return ProtectionMode.MAC;
+                public VerificationContext getInputVerification() {
+                    return downstreamVerification;
                 }
 
                 @Override
-                public byte[] getSecret() {
-                    return sharedSecret;
+                public NestedEndpointContext getNestedEndpointContext() {
+                    return null; // No nested messages
                 }
 
                 @Override
-                public String getSenderKID() {
-                    return senderKid;
+                public CredentialContext getOutputCredentials() {
+                    return null; // Response protection handled automatically for MAC
                 }
 
                 @Override
-                public java.security.cert.X509Certificate getSenderCertificate() {
-                    return null; // Not using signature-based protection
+                public ReprotectMode getReprotectMode() {
+                    return ReprotectMode.keep; // Keep MAC protection on responses
                 }
 
                 @Override
-                public java.security.PrivateKey getSenderPrivateKey() {
-                    return null; // Not using signature-based protection
+                public boolean getSuppressRedundantExtraCerts() {
+                    return false;
                 }
 
                 @Override
-                public java.util.List<java.security.cert.X509Certificate> getExtraCertificates() {
-                    return Collections.emptyList();
+                public boolean isCacheExtraCerts() {
+                    return true; // Cache certificates for polling
                 }
 
                 @Override
-                public boolean getImplicitConfirm() {
-                    return false; // EJBCA typically requires explicit confirm
-                }
-
-                @Override
-                public String getHashAlgorithm() {
-                    return "SHA256"; // Upgraded from default SHA1 per requirements
-                }
-
-                @Override
-                public int getHashMinRounds() {
-                    return 5000; // Per CABackendParams-Kind-CMP.txt default
-                }
-
-                @Override
-                public int getHashMaxRounds() {
-                    return 10000; // Per CABackendParams-Kind-CMP.txt default
-                }
-
-                @Override
-                public int getHashSaltSize() {
-                    return 32; // Per CABackendParams-Kind-CMP.txt default
+                public boolean isMessageTimeDeviationAllowed(long deviation) {
+                    return Math.abs(deviation) <= 300; // Allow 5 minutes deviation
                 }
             };
         }
 
         @Override
-        public CmpMessageInterface getUpstreamConfiguration(String certProfile, int bodyType) {
-            // Same protection for upstream to EJBCA
-            return getDownstreamConfiguration(certProfile, bodyType);
+        public int getDownstreamTimeout(String certProfile, int bodyType) {
+            return 300; // 5 minutes timeout
         }
 
         @Override
         public VerificationContext getEnrollmentTrust(String certProfile, int bodyType) {
-            return null; // Skipping certificate validation for PoC
+            return null; // No enrollment trust validation in pass-through mode
         }
 
         @Override
         public boolean getForceRaVerifyOnUpstream(String certProfile, int bodyType) {
-            return false;
+            return false; // Don't force RaVerified for EJBCA
         }
 
         @Override
@@ -236,23 +284,63 @@ public class EjbcaCmpBridge {
         }
 
         @Override
-        public int getDownstreamTimeout(String certProfile, int bodyType) {
-            return 60; // 60 seconds timeout
+        public PersistencyInterface getPersistency() {
+            return new PersistencyInterface() {}; // No persistence needed
         }
 
         @Override
         public int getRetryAfterTimeInSeconds(String certProfile, int bodyType) {
-            return 10; // Poll retry after 10 seconds
+            return 10; // Poll every 10 seconds if delayed
         }
 
         @Override
-        public SupportMessageHandlerInterface getSupportMessageHandler(String certProfile, int bodyType) {
-            return null; // No support messages
+        public SupportMessageHandlerInterface getSupportMessageHandler(String certProfile, String infoTypeOid) {
+            return null; // No GENM support needed
         }
 
         @Override
-        public boolean getRaVerifiedAcceptable(String certProfile, int bodyType) {
-            return false;
+        public CmpMessageInterface getUpstreamConfiguration(String certProfile, int bodyType) {
+            return new CmpMessageInterface() {
+                @Override
+                public VerificationContext getInputVerification() {
+                    return null; // Don't verify EJBCA responses (trust the channel)
+                }
+
+                @Override
+                public NestedEndpointContext getNestedEndpointContext() {
+                    return null;
+                }
+
+                @Override
+                public CredentialContext getOutputCredentials() {
+                    return upstreamCredentials; // Protect requests to EJBCA with MAC
+                }
+
+                @Override
+                public ReprotectMode getReprotectMode() {
+                    return ReprotectMode.reprotect; // Always protect outgoing messages
+                }
+
+                @Override
+                public boolean getSuppressRedundantExtraCerts() {
+                    return false;
+                }
+
+                @Override
+                public boolean isCacheExtraCerts() {
+                    return false;
+                }
+
+                @Override
+                public boolean isMessageTimeDeviationAllowed(long deviation) {
+                    return true; // Allow any time deviation for EJBCA
+                }
+            };
+        }
+
+        @Override
+        public boolean isRaVerifiedAcceptable(String certProfile, int bodyType) {
+            return false; // Require proper POPO (Proof of Possession)
         }
     }
 }
