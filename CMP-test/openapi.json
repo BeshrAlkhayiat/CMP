@@ -1,0 +1,2527 @@
+{
+  "openapi": "3.0.2",
+  "info": {
+    "title": "CEMA Registration Authority",
+    "description": "A server for providing certificates through a backend CA.",
+    "version": "$[version]"
+  },
+  "servers": "$[servers]",
+  "tags": [
+    {
+      "name": "Authentication",
+      "description": "Authentication, login, single-sign-on and related functionality"
+    },
+    {
+      "name": "RegistrationAuthority Operation",
+      "description": "Operations for Registration Authority (RA) functionality"
+    }
+  ],
+  "paths": {
+    "/auth/identify": {
+      "post": {
+        "tags": [ "Authentication" ],
+        "operationId": "loginIdentification",
+        "description": "Prepares a login by identifying a user.",
+        "summary": "Privilege: -",
+        "requestBody": {
+          "description": "The data for user identification in a session.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserLoginRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AuthResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequestResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          }
+        }
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "tags": [ "Authentication" ],
+        "operationId": "loginAuthentication",
+        "description": "Completes login by authenticating an identified user.",
+        "summary": "Privilege: -",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFTokenHeaderParameter"
+          }
+        ],
+        "requestBody": {
+          "description": "The response to a previous challenge.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthChallengeResponse"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AuthResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequestResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          }
+        }
+      }
+    },
+    "/auth/logout": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        }
+      ],
+      "post": {
+        "tags": [ "Authentication" ],
+        "operationId": "logout",
+        "description": "Logs the user out and terminates the session by telling the browser to discard the authentication cookie.",
+        "summary": "Privilege: -",
+        "responses": {
+          "204": {
+            "description": "Successfully logged out."
+          }
+        }
+      }
+    },
+    "/auth/refresh": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        }
+      ],
+      "post": {
+        "tags": [ "Authentication" ],
+        "operationId": "loginRefresh",
+        "description": "Refreshes the session authentication by updating the authentication cookie.",
+        "summary": "Privilege: -",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFTokenHeaderParameter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AuthTokenResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequestResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          }
+        }
+      }
+    },
+    "/auth/sso": {
+      "get": {
+        "tags": [ "Authentication" ],
+        "operationId": "singleSignOn",
+        "description": "Attempts an automatic single-sign-on by identifying a user by browser specific authentication information (e.g. TLS client certificate or Kerberos).",
+        "summary": "Privilege: -",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AuthResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          }
+        }
+      }
+    },
+    "/ca": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        }
+      ],
+      "get": {
+        "tags": [ "RegistrationAuthority Operation" ],
+        "operationId": "listCAs",
+        "description": "Lists all available active CA names for which the caller is authorized.",
+        "summary": "Privilege: CA_ACCESS",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/CANameListResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          }
+        }
+      }
+    },
+    "/ca/approve/by-uuid/{uniqueID}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        },
+        {
+          "$ref": "#/components/parameters/UUIDPathParameter"
+        }
+      ],
+      "post": {
+        "tags": [ "RegistrationAuthority Operation" ],
+        "operationId": "approveRequestByUUID",
+        "description": "Approves a certificate request by its unique ID.",
+        "summary": "Privilege: CA_ACCESS & TEMPLATE_ACCESS & CERTIFICATE_APPROVE",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFTokenHeaderParameter"
+          }
+        ],
+        "responses": {
+          "201": {
+            "$ref": "#/components/responses/IssuedCertificateDataResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequestResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ObjectNotFoundResponse"
+          },
+          "409": {
+            "$ref": "#/components/responses/QuotaExceededResponse"
+          }
+        }
+      }
+    },
+    "/ca/auto-issue/{lookupName}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        },
+        {
+          "$ref": "#/components/parameters/LookupNamePathParameter"
+        },
+        {
+          "$ref": "#/components/parameters/ContentFormatParameter"
+        }
+      ],
+      "post": {
+        "tags": [ "RegistrationAuthority Operation" ],
+        "operationId": "autoIssueCertificate",
+        "description": "Issues a certificate for a given PKCS#10 CSR.",
+        "summary": "Privileges: CA_ACCESS & TEMPLATE_ACCESS & CERTIFICATE_ISSUE",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFTokenHeaderParameter"
+          }
+        ],
+        "requestBody": {
+          "description": "The data for the new certificate to issue.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CertificateRequestSign"
+              },
+              "example": {
+                "csr": "Base64(-----BEGIN CERTIFICATE REQUEST-----\n.....\n-----END CERTIFICATE REQUEST-----)",
+                "commonName": "John Doe",
+                "SAN": {
+                  "mail": [
+                    "john.doe@intellicard.ch"
+                  ]
+                },
+                "validity": "2y",
+                "notify": "hr@acme.org"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "$ref": "#/components/responses/IssuedCertificateDataResponse"
+          },
+          "202": {
+            "$ref": "#/components/responses/IssuancePendingResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequestResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ObjectNotFoundResponse"
+          },
+          "409": {
+            "$ref": "#/components/responses/QuotaExceededResponse"
+          }
+        }
+      }
+    },
+    "/ca/reject/by-uuid/{uniqueID}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        },
+        {
+          "$ref": "#/components/parameters/UUIDPathParameter"
+        }
+      ],
+      "post": {
+        "tags": [ "RegistrationAuthority Operation" ],
+        "operationId": "rejectRequestByUUID",
+        "description": "Rejects a certificate request by its unique ID.",
+        "summary": "Privilege: CA_ACCESS & TEMPLATE_ACCESS & CERTIFICATE_APPROVE",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFTokenHeaderParameter"
+          }
+        ],
+        "requestBody": {
+          "description": "The data for the certificate request rejection.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CertificateRejectionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/IssuedCertificateDataResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequestResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ObjectNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/ca/{caName}/cert": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        },
+        {
+          "$ref": "#/components/parameters/CANamePathParameter"
+        },
+        {
+          "$ref": "#/components/parameters/ContentFormatParameter"
+        }
+      ],
+      "get": {
+        "tags": [ "RegistrationAuthority Operation" ],
+        "operationId": "readCACertificate",
+        "description": "Reads the CA certificate.",
+        "summary": "Privilege: CA_ACCESS & CERTIFICATE_ACCESS",
+        "responses": {
+          "200": {
+            "description": "The CA certificate in the requested format.",
+            "headers": {
+              "X-CSRF-Token": {
+                "description": "The CSRF token to use for subsequent requests.",
+                "schema": {
+                  "type": "string",
+                  "example": "d52b8cc71f87f1fd1cedd95f05ad93351f135270b453d7309c8fbda0a9f730e5"
+                }
+              }
+            },
+            "content": {
+              "application/pkix-cert": {
+                "schema": {
+                  "description": "The raw certificate data in the requested format.",
+                  "type": "string",
+                  "format": "byte",
+                  "example": "Base64(-----BEGIN CERTIFICATE-----\n.....\n-----END CERTIFICATE-----)"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ObjectNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/ca/{caName}/chain": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        },
+        {
+          "$ref": "#/components/parameters/CANamePathParameter"
+        }
+      ],
+      "get": {
+        "tags": [ "RegistrationAuthority Operation" ],
+        "operationId": "readCACertificateChain",
+        "description": "Reads the entire CA certificate chain in PEM format.",
+        "summary": "Privilege: CA_ACCESS & CERTIFICATE_ACCESS",
+        "responses": {
+          "200": {
+            "description": "The CA certificate chain in PEM format.",
+            "headers": {
+              "X-CSRF-Token": {
+                "description": "The CSRF token to use for subsequent requests.",
+                "schema": {
+                  "type": "string",
+                  "example": "d52b8cc71f87f1fd1cedd95f05ad93351f135270b453d7309c8fbda0a9f730e5"
+                }
+              }
+            },
+            "content": {
+              "application/x-pem-file": {
+                "schema": {
+                  "description": "The raw certificate chain data in PEM format.",
+                  "type": "string",
+                  "format": "byte",
+                  "example": "Base64(-----BEGIN CERTIFICATE-----\n.....\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\n.....\n-----END CERTIFICATE-----)"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ObjectNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/ca/{caName}/fetch": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        },
+        {
+          "$ref": "#/components/parameters/CANamePathParameter"
+        }
+      ],
+      "post": {
+        "tags": [ "RegistrationAuthority Operation" ],
+        "operationId": "fetchPendingCertificate",
+        "description": "Attempts to fetch a pending certificate.",
+        "summary": "Privileges: CA_ACCESS & CERTIFICATE_ACCESS",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFTokenHeaderParameter"
+          }
+        ],
+        "requestBody": {
+          "description": "The UUID of the pending certificate request.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FetchPendingRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "$ref": "#/components/responses/IssuedCertificateDataResponse"
+          },
+          "202": {
+            "$ref": "#/components/responses/IssuancePendingResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequestResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ObjectNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/ca/{caName}/reasons": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        },
+        {
+          "$ref": "#/components/parameters/CANamePathParameter"
+        }
+      ],
+      "get": {
+        "tags": [ "RegistrationAuthority Operation" ],
+        "operationId": "listSupportedRevocationReasons",
+        "description": "Lists the supported revocation reasons of a CA.",
+        "summary": "Privileges: CA_ACCESS",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/RevocationReasonListResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ObjectNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/ca/{caName}/revoke": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        },
+        {
+          "$ref": "#/components/parameters/CANamePathParameter"
+        }
+      ],
+      "patch": {
+        "tags": [ "RegistrationAuthority Operation" ],
+        "operationId": "revokeCertificate",
+        "description": "Revokes a certificate.",
+        "summary": "Privileges: CA_ACCESS & CERTIFICATE_REVOKE",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFTokenHeaderParameter"
+          }
+        ],
+        "requestBody": {
+          "description": "The serial number of the certificate to revoke.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevocationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/CertificateMetaResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequestResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ObjectNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/ca/{caName}/status": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        },
+        {
+          "$ref": "#/components/parameters/CANamePathParameter"
+        }
+      ],
+      "post": {
+        "tags": [ "RegistrationAuthority Operation" ],
+        "operationId": "getCertificateStatus",
+        "description": "Retrieves the status of a certificate.",
+        "summary": "Privileges: CA_ACCESS & CERTIFICATE_ACCESS",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFTokenHeaderParameter"
+          }
+        ],
+        "requestBody": {
+          "description": "The serial number of the certificate for which to get the status.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CertificateStatusRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/CertificateMetaResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequestResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ObjectNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/ca/{caName}/template": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        },
+        {
+          "$ref": "#/components/parameters/CANamePathParameter"
+        }
+      ],
+      "get": {
+        "tags": [ "RegistrationAuthority Operation" ],
+        "operationId": "listCertificateTemplates",
+        "description": "Lists all available active template names of a CA for which the caller is authorized.",
+        "summary": "Privileges: CA_ACCESS & TEMPLATE_ACCESS",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/TemplateNameListResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ObjectNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/ca/{caName}/template/{tplName}/generate": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        },
+        {
+          "$ref": "#/components/parameters/CANamePathParameter"
+        },
+        {
+          "$ref": "#/components/parameters/TemplateNamePathParameter"
+        },
+        {
+          "$ref": "#/components/parameters/ContentFormatParameter"
+        }
+      ],
+      "post": {
+        "tags": [ "RegistrationAuthority Operation" ],
+        "operationId": "generateCertificate",
+        "description": "Generates a new key pair and issues a certificate for it.",
+        "summary": "Privileges: CA_ACCESS & TEMPLATE_ACCESS & CERTIFICATE_ISSUE",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFTokenHeaderParameter"
+          }
+        ],
+        "requestBody": {
+          "description": "The data for the new certificate to issue.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CertificateRequestGen"
+              },
+              "example": {
+                "kind": "RSA",
+                "size": 2048,
+                "commonName": "wiki.intellicard.ch",
+                "SAN": {
+                  "DNS": [
+                    "support.intellicard.ch",
+                    "jira.intellicard.ch"
+                  ]
+                },
+                "validity": "90d",
+                "returnRoot": true,
+                "notify": "it@acme.org"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "$ref": "#/components/responses/IssuedCertificateDataResponse"
+          },
+          "202": {
+            "$ref": "#/components/responses/IssuancePendingResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequestResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ObjectNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/ca/{caName}/template/{tplName}/issue": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuthTokenCookieParameter"
+        },
+        {
+          "$ref": "#/components/parameters/AuthTokenHeaderParameter"
+        },
+        {
+          "$ref": "#/components/parameters/CANamePathParameter"
+        },
+        {
+          "$ref": "#/components/parameters/TemplateNamePathParameter"
+        },
+        {
+          "$ref": "#/components/parameters/ContentFormatParameter"
+        }
+      ],
+      "post": {
+        "tags": [ "RegistrationAuthority Operation" ],
+        "operationId": "issueCertificate",
+        "description": "Issues a certificate for a given PKCS#10 CSR.",
+        "summary": "Privileges: CA_ACCESS & TEMPLATE_ACCESS & CERTIFICATE_ISSUE",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFTokenHeaderParameter"
+          }
+        ],
+        "requestBody": {
+          "description": "The data for the new certificate to issue.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CertificateRequestSign"
+              },
+              "example": {
+                "csr": "Base64(-----BEGIN CERTIFICATE REQUEST-----\n.....\n-----END CERTIFICATE REQUEST-----)",
+                "commonName": "John Doe",
+                "SAN": {
+                  "mail": [
+                    "john.doe@intellicard.ch"
+                  ]
+                },
+                "validity": "2y",
+                "notify": "hr@acme.org"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "$ref": "#/components/responses/IssuedCertificateDataResponse"
+          },
+          "202": {
+            "$ref": "#/components/responses/IssuancePendingResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequestResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessDeniedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ObjectNotFoundResponse"
+          },
+          "409": {
+            "$ref": "#/components/responses/QuotaExceededResponse"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "AuthTokenCookieParameter": {
+        "name": "AuthToken",
+        "in": "cookie",
+        "description": "Provides an authentication token (either cookie or header is required).",
+        "required": false,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "AuthTokenHeaderParameter": {
+        "name": "X-AuthToken",
+        "in": "header",
+        "description": "Provides an authentication token (either cookie or header is required).",
+        "required": false,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "CANamePathParameter": {
+        "name": "caName",
+        "in": "path",
+        "description": "The name of the CA on which to operate.",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "ContentFormatParameter": {
+        "name": "format",
+        "in": "query",
+        "description": "The desired format for requested data.",
+        "required": false,
+        "schema": {
+          "$ref": "#/components/schemas/RawDataEncodingKind"
+        }
+      },
+      "CSRFTokenHeaderParameter": {
+        "name": "X-CSRF-Token",
+        "in": "header",
+        "description": "Provides a CSRF token that was received earlier (required for all modifying operations). Note that such tokens eventually expire, so it is best to always send the most recently received token. It is not necessary, however, to fetch a specific CSRF token for certain operations: any previously received token will be acceptable, as long as it was received from the same server and has not yet expired.",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "example": "d52b8cc71f87f1fd1cedd95f05ad93351f135270b453d7309c8fbda0a9f730e5"
+        }
+      },
+      "LookupNamePathParameter": {
+        "name": "lookupName",
+        "in": "path",
+        "description": "The name of the lookup on which to resolve CA and template info.",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "TemplateNamePathParameter": {
+        "name": "tplName",
+        "in": "path",
+        "description": "The name of the template on which to operate.",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "UUIDPathParameter": {
+        "name": "uniqueID",
+        "in": "path",
+        "description": "The unique ID of the object on which to operate.",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "responses": {
+      "AccessDeniedResponse": {
+        "description": "In case access was denied for any reason.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorInfo"
+            },
+            "example": {
+              "msg": "missing required privilege"
+            }
+          }
+        }
+      },
+      "AuthResponse": {
+        "description": "The response during login. When successfully authenticated, a cookie is returned with the authentication token that must be sent in further (authenticated) requests.",
+        "headers": {
+          "Set-Cookie": {
+            "schema": {
+              "type": "string",
+              "example": "AuthToken=abcdef1234; Path=/; Secure; HttpOnly"
+            }
+          },
+          "X-CSRF-Token": {
+            "description": "The CSRF token to use for subsequent requests.",
+            "schema": {
+              "type": "string",
+              "example": "d52b8cc71f87f1fd1cedd95f05ad93351f135270b453d7309c8fbda0a9f730e5"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/AuthResponse"
+            }
+          }
+        }
+      },
+      "AuthTokenResponse": {
+        "description": "The response during a running session. Updates the authentication cookie for prolonged use.",
+        "headers": {
+          "Set-Cookie": {
+            "schema": {
+              "type": "string",
+              "example": "AuthToken=abcdef1234; Path=/; Secure; HttpOnly"
+            }
+          },
+          "X-CSRF-Token": {
+            "description": "The CSRF token to use for subsequent requests.",
+            "schema": {
+              "type": "string",
+              "example": "d52b8cc71f87f1fd1cedd95f05ad93351f135270b453d7309c8fbda0a9f730e5"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/AuthTokenResponse"
+            }
+          }
+        }
+      },
+      "CANameListResponse": {
+        "description": "The response providing a list of CA names.",
+        "headers": {
+          "X-CSRF-Token": {
+            "description": "The CSRF token to use for subsequent requests.",
+            "schema": {
+              "type": "string",
+              "example": "d52b8cc71f87f1fd1cedd95f05ad93351f135270b453d7309c8fbda0a9f730e5"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/NameList"
+            },
+            "example": [
+              "RootCAv2",
+              "InfraCAv4",
+              "TlsCAv3"
+            ]
+          }
+        }
+      },
+      "CertificateMetaResponse": {
+        "description": "The response providing certificate meta information.",
+        "headers": {
+          "X-CSRF-Token": {
+            "description": "The CSRF token to use for subsequent requests.",
+            "schema": {
+              "type": "string",
+              "example": "d52b8cc71f87f1fd1cedd95f05ad93351f135270b453d7309c8fbda0a9f730e5"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CertificateMeta"
+            }
+          }
+        }
+      },
+      "DuplicateObjectResponse": {
+        "description": "In case another object with conflicting properties already exists (e.g. with the same primary key ID or the same unique name).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorInfo"
+            },
+            "example": {
+              "msg": "another object with the same key characteristics already exists"
+            }
+          }
+        }
+      },
+      "InvalidRequestResponse": {
+        "description": "In case the provided data is not acceptable.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorInfo"
+            },
+            "example": {
+              "msg": "the given input data is invalid"
+            }
+          }
+        }
+      },
+      "IssuancePendingResponse": {
+        "description": "Status information of a pending certificate issuance.",
+        "headers": {
+          "X-CSRF-Token": {
+            "description": "The CSRF token to use for subsequent requests.",
+            "schema": {
+              "type": "string",
+              "example": "d52b8cc71f87f1fd1cedd95f05ad93351f135270b453d7309c8fbda0a9f730e5"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/IssuancePendingResponseData"
+            }
+          }
+        }
+      },
+      "IssuedCertificateDataResponse": {
+        "description": "Full data of an issued certificate.",
+        "headers": {
+          "X-CSRF-Token": {
+            "description": "The CSRF token to use for subsequent requests.",
+            "schema": {
+              "type": "string",
+              "example": "d52b8cc71f87f1fd1cedd95f05ad93351f135270b453d7309c8fbda0a9f730e5"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/IssuedCertificateData"
+            }
+          }
+        }
+      },
+      "ObjectNotFoundResponse": {
+        "description": "In case no object was found with the given ID or name.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorInfo"
+            },
+            "example": {
+              "msg": "no object with the given name or ID could be found"
+            }
+          }
+        }
+      },
+      "ObjectStillInUseResponse": {
+        "description": "In case an object cannot be removed because it is still in use (referenced) by other objects.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorInfo"
+            },
+            "example": {
+              "msg": "the object is still in use"
+            }
+          }
+        }
+      },
+      "QuotaExceededResponse": {
+        "description": "In case an assigned quota is exceeded.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorInfo"
+            },
+            "example": {
+              "msg": "nore more quota items available"
+            }
+          }
+        }
+      },
+      "RevocationReasonListResponse": {
+        "description": "The response providing a list of revocation reasons.",
+        "headers": {
+          "X-CSRF-Token": {
+            "description": "The CSRF token to use for subsequent requests.",
+            "schema": {
+              "type": "string",
+              "example": "d52b8cc71f87f1fd1cedd95f05ad93351f135270b453d7309c8fbda0a9f730e5"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/RevocationReason"
+              }
+            },
+            "example": [
+              "KEY_COMPROMISE",
+              "AFFILIATION_CHANGED",
+              "SUPERSEDED",
+              "CESSATION_OF_OPERATION"
+            ]
+          }
+        }
+      },
+      "TemplateNameListResponse": {
+        "description": "The response providing a list of template names.",
+        "headers": {
+          "X-CSRF-Token": {
+            "description": "The CSRF token to use for subsequent requests.",
+            "schema": {
+              "type": "string",
+              "example": "d52b8cc71f87f1fd1cedd95f05ad93351f135270b453d7309c8fbda0a9f730e5"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/NameList"
+            },
+            "example": [
+              "WebServer",
+              "IssuingCA",
+              "Employee"
+            ]
+          }
+        }
+      },
+      "UnsupportedModificationResponse": {
+        "description": "In case a modification is not allowed/supported.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorInfo"
+            },
+            "example": {
+              "msg": "unsupported modification"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "AuthChallenge": {
+        "description": "A challenge during login.",
+        "type": "object",
+        "properties": {
+          "kind": {
+            "description": "The kind of the challenge.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AuthChallengeKind"
+              }
+            ]
+          },
+          "params": {
+            "description": "Optional challenge parameters, meaning depends on the challenge kind.",
+            "type": "string",
+            "maxLength": 256,
+            "example": "OCRA-1:TOTP-SHA256-6:QN06"
+          },
+          "token": {
+            "description": "The login token.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "example": "1887926396247592855"
+          },
+          "value": {
+            "description": "Optional challenge value, meaning depends on the challenge kind.",
+            "type": "string",
+            "maxLength": 256,
+            "example": "829317"
+          }
+        },
+        "required": [
+          "kind",
+          "token"
+        ]
+      },
+      "AuthChallengeKind": {
+        "description": "Possible challenges during login.",
+        "type": "string",
+        "enum": [
+          "PIN",
+          "PWD",
+          "TOTP"
+        ]
+      },
+      "AuthChallengeResponse": {
+        "description": "The response to an authentication challenge.",
+        "type": "object",
+        "properties": {
+          "ctx": {
+            "description": "The response context.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AuthContext"
+              }
+            ]
+          },
+          "kind": {
+            "description": "The kind of the challenge.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AuthChallengeKind"
+              }
+            ]
+          },
+          "params": {
+            "description": "Optional challenge parameters.",
+            "type": "string",
+            "maxLength": 256,
+            "example": "OCRA-1:TOTP-SHA256-6:QN06"
+          },
+          "token": {
+            "description": "The login token.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "example": "1887926396247592855"
+          },
+          "challenge": {
+            "description": "The challenge value which this response responds to.",
+            "type": "string",
+            "maxLength": 256,
+            "example": "829317"
+          },
+          "response": {
+            "description": "The response to the challenge value.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "example": "347264"
+          }
+        },
+        "required": [
+          "ctx",
+          "kind",
+          "token",
+          "response"
+        ]
+      },
+      "AuthContext": {
+        "description": "The context of an authentication request.",
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "description": "The tenant ID.",
+            "type": "integer",
+            "example": 314
+          },
+          "dept": {
+            "description": "The department ID.",
+            "type": "integer",
+            "example": 281
+          },
+          "user": {
+            "description": "The user ID.",
+            "type": "integer",
+            "example": 781
+          },
+          "display": {
+            "description": "The user display name.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "example": "John Doe"
+          },
+          "principal": {
+            "description": "The (optional) user principal for single sign-on.",
+            "type": "string",
+            "maxLength": 256,
+            "example": "CN=John Doe,O=intelliCard Solutions AG,C=CH"
+          },
+          "lang": {
+            "description": "The ID of the preferred content language.",
+            "type": "integer",
+            "example": 1791
+          },
+          "sysLang": {
+            "description": "The preferred system language.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SystemLanguage"
+              }
+            ]
+          },
+          "mechanism": {
+            "description": "The authentication mechanism being used.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AuthMechanism"
+              }
+            ]
+          },
+          "session": {
+            "description": "The session ID.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "example": "2722167074769394061"
+          }
+        },
+        "required": [
+          "tenant",
+          "dept",
+          "user",
+          "display",
+          "lang",
+          "sysLang",
+          "session"
+        ]
+      },
+      "AuthMechanism": {
+        "description": "Possible authentication mechanisms during login.",
+        "type": "string",
+        "enum": [
+          "NONE",
+          "UNKNOWN",
+          "USERNAME_PASSWORD",
+          "CLIENT_CERTIFICATE",
+          "KERBEROS",
+          "OPEN_ID_CONNECT"
+        ]
+      },
+      "AuthResponse": {
+        "description": "The response to an authentication request.",
+        "type": "object",
+        "properties": {
+          "ctx": {
+            "description": "The response context.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AuthContext"
+              }
+            ]
+          },
+          "lvl": {
+            "description": "The security level. Will be assigned based on the used/active mechanisms during user authentication (single-sign-on, standard password, 2FA, etc).",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AuthSecurityLevel"
+              }
+            ]
+          },
+          "tok": {
+            "description": "The authentication token for further requests. Only a placeholder, the actual token is passed as a cookie.",
+            "type": "string",
+            "example": "c4665b...24753b49ac4f3"
+          },
+          "expiry": {
+            "description": "The expiry time of the authentication token.",
+            "type": "string",
+            "format": "date-time",
+            "example": "2020-09-25T18:03:42Z"
+          },
+          "timeout": {
+            "description": "The expiry time of the entire session (when tokens cannot be refreshed anymore).",
+            "type": "string",
+            "format": "date-time",
+            "example": "2020-09-25T18:03:42Z"
+          },
+          "public": {
+            "description": "The flag whether this response is for public access. Regular login responses will have this set to false, while responses to the tenant-specific public access URL will have this set to true.",
+            "type": "boolean",
+            "default": false
+          },
+          "last": {
+            "description": "The last login time.",
+            "type": "string",
+            "format": "date-time",
+            "example": "2021-09-21T08:00:42Z"
+          },
+          "lastLoginFailure": {
+            "description": "The time of the last failed login attempt.",
+            "type": "string",
+            "format": "date-time",
+            "example": "2021-08-04T17:19:21Z"
+          },
+          "loginFailures": {
+            "description": "The number of failed login attempts since last successful login.",
+            "type": "integer",
+            "minimum": 0
+          },
+          "tenant": {
+            "description": "The name of the tenant of the user.",
+            "type": "string",
+            "minLength": 1,
+            "example": "CEMA Inc."
+          },
+          "tenantDomain": {
+            "description": "The domain name of the tenant.",
+            "type": "string",
+            "minLength": 1,
+            "example": "acme.org"
+          },
+          "dept": {
+            "description": "The name of the department of the user.",
+            "type": "string",
+            "minLength": 1,
+            "example": "Research"
+          },
+          "deptDomain": {
+            "description": "The domain name of the department.",
+            "type": "string",
+            "minLength": 1,
+            "example": "acme.org"
+          },
+          "user": {
+            "description": "The login name of the user.",
+            "type": "string",
+            "minLength": 1,
+            "example": "jdo"
+          },
+          "userDomain": {
+            "description": "The domain name of the user.",
+            "type": "string",
+            "minLength": 1,
+            "example": "acme.org"
+          },
+          "systemGroups": {
+            "description": "The names of the system groups of which the authenticated user is a member.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "groups": {
+            "description": "The names of the groups of which the authenticated user is a member.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "privileges": {
+            "description": "The privileges that the authenticated user has.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Privilege"
+            }
+          },
+          "challenge": {
+            "description": "The authentication challenge.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AuthChallenge"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ctx",
+          "lvl"
+        ]
+      },
+      "AuthSecurityLevel": {
+        "description": "Supported security levels for trust/assurance evaluation.",
+        "type": "string",
+        "enum": [
+          "NONE",
+          "LOW",
+          "MEDIUM",
+          "HIGH",
+          "FULL"
+        ]
+      },
+      "AuthTokenResponse": {
+        "description": "The response to an authentication refresh request.",
+        "type": "object",
+        "properties": {
+          "tok": {
+            "description": "The authentication token for further requests. Only a placeholder, the actual token is passed as a cookie.",
+            "type": "string",
+            "example": "c4665b...24753b49ac4f3"
+          },
+          "expiry": {
+            "description": "The expiry time of the authentication token.",
+            "type": "string",
+            "format": "date-time",
+            "example": "2020-09-25T18:03:42Z"
+          }
+        },
+        "required": [
+          "tok",
+          "expiry"
+        ]
+      },
+      "CertificateKind": {
+        "description": "Certificate kind.",
+        "type": "string",
+        "enum": [
+          "UNKNOWN",
+          "SELF_SIGNED",
+          "ROOT_CA",
+          "INTERMEDIATE_CA",
+          "SERVER_EE",
+          "CLIENT_EE",
+          "MACHINE_EE",
+          "PERSONAL_EE",
+          "GENERIC_EE",
+          "REGISTRATION_AUTHORITY",
+          "TIMESTAMP_AUTHORITY",
+          "OCSP_RESPONDER",
+          "CODE_SIGNING",
+          "MAIL_SIGNING",
+          "GENERIC_SIGNING",
+          "MAIL_ENCRYPTION",
+          "GENERIC_ENCRYPTION",
+          "SMIME_EE",
+          "GENERIC_LOGON",
+          "SMARTCARD_LOGON"
+        ]
+      },
+      "CertificateMeta": {
+        "description": "Certificate meta data properties.",
+        "type": "object",
+        "properties": {
+          "id": {
+            "description": "The ID of the freshly issued certificate.",
+            "type": "integer"
+          },
+          "issuerId": {
+            "description": "The ID of the issuer certificate.",
+            "type": "integer"
+          },
+          "tplName": {
+            "description": "The name of the template on which this certificate is based.",
+            "type": "string",
+            "maxLength": 64,
+            "example": "WebServer"
+          },
+          "caName": {
+            "description": "The name of the CA configuration through which this certificate was issued.",
+            "type": "string",
+            "maxLength": 64,
+            "example": "InfrastructureCAv1"
+          },
+          "protocol": {
+            "description": "The used enrollment protocol.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EnrollmentProtocol"
+              }
+            ]
+          },
+          "recipient": {
+            "description": "The e-mail address of the primary recipient of this certificate.",
+            "type": "string",
+            "maxLength": 128,
+            "example": "webmaster@cema.org"
+          },
+          "kind": {
+            "description": "The kind of the certificate.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CertificateKind"
+              }
+            ]
+          },
+          "keyFamily": {
+            "description": "The family of the key underlying this certificate.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/KeyPairFamily"
+              }
+            ]
+          },
+          "keyGroup": {
+            "description": "The group of the key underlying this certificate.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/KeyPairGroup"
+              }
+            ]
+          },
+          "keyKind": {
+            "description": "The kind of key underlying this certificate.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/KeyPairKind"
+              }
+            ]
+          },
+          "keyCurve": {
+            "description": "The elliptic curve name for EC keys, undefined for other keys.",
+            "type": "string",
+            "maxLength": 64,
+            "example": "secp256r1"
+          },
+          "keySize": {
+            "description": "The size of the key in bits.",
+            "type": "integer",
+            "example": 2048
+          },
+          "keyStrength": {
+            "description": "The numeric strength of the key. Note that this normally corresponds to the key size, but can differ from it in case the standards have established a different number for indicating the strength, because the key sizes might have become too unfamiliar (such as for the PQC ML-DSA and SLH-DSA variants).",
+            "type": "integer",
+            "example": 2048
+          },
+          "keyPQCSafe": {
+            "description": "Whether the the key is considered post-quantum safe.",
+            "type": "boolean",
+            "default": false
+          },
+          "keyStorage": {
+            "description": "The storage of the key underlying this certificate.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/KeyStorage"
+              }
+            ]
+          },
+          "algo": {
+            "description": "The signature algorithm name.",
+            "type": "string",
+            "maxLength": 64,
+            "example": "sha256withECDSA"
+          },
+          "validityStatus": {
+            "description": "The validity status of this certificate.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CertificateValidity"
+              }
+            ]
+          },
+          "status": {
+            "description": "The lifecycle status of this certificate.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CertificateStatus"
+              }
+            ]
+          },
+          "reason": {
+            "description": "The reason for revocation of this certificate.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RevocationReason"
+              }
+            ]
+          },
+          "selfSigned": {
+            "description": "Whether this is a self-signed certificate.",
+            "type": "boolean",
+            "default": false
+          },
+          "ca": {
+            "description": "Whether this is a CA certificate.",
+            "type": "boolean",
+            "default": false
+          },
+          "issuerDN": {
+            "description": "The full distinguished name of the issuer.",
+            "type": "string",
+            "maxLength": 256,
+            "example": "CN=Infrastructure CA v1,O=intelliCard Solutions AG,C=CH"
+          },
+          "issuerCN": {
+            "description": "The pure common name of the issuer.",
+            "type": "string",
+            "maxLength": 64,
+            "example": "Infrastructure CA v1"
+          },
+          "subjectDN": {
+            "description": "The full distinguished name of the subject.",
+            "type": "string",
+            "maxLength": 256,
+            "example": "CN=wiki.intellicard.ch,O=intelliCard Solutions AG,C=CH"
+          },
+          "subjectCN": {
+            "description": "The pure common name of the subject.",
+            "type": "string",
+            "maxLength": 64,
+            "example": "wiki.intellicard.ch"
+          },
+          "sanCount": {
+            "description": "The total number of subject alternative names (SANs) in this certificate.",
+            "type": "integer",
+            "example": 3
+          },
+          "primarySAN": {
+            "description": "The primary (i.e. first) subject alternative name (SAN) of this certificate.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SAN"
+              }
+            ]
+          },
+          "furtherSANs": {
+            "description": "The list of further subject alternative name (SAN) of this certificate. Note that the standard doesn't forbid duplicate SANs.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SAN"
+            }
+          },
+          "serial": {
+            "description": "The (decimal) serial number of this certificate.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "example": "2722167074769394176"
+          },
+          "fingerprint": {
+            "description": "The SHA-256 fingerprint of this certificate.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "example": "c6f6e75b386bc9898d57af5a50f43c4f0b0800348f3f3a399d0b92fffb6e2942"
+          },
+          "fingerprintMD5": {
+            "description": "The (legacy) MD5 fingerprint of this certificate.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32,
+            "example": "4c4dc6b4e79b7d99231ac0606977a128"
+          },
+          "fingerprintSHA1": {
+            "description": "The (legacy) SHA-1 fingerprint of this certificate.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40,
+            "example": "e0dbbccd44db3f490d0cf8a73dabf5cce4663b8f"
+          },
+          "hasStdKeyID": {
+            "description": "Whether this certificate contains a SubjectKeyIdentifier extension containing the standardized KeyID.",
+            "type": "boolean",
+            "default": false,
+            "example": true
+          },
+          "extKeyID": {
+            "description": "The KeyID which is declared in the SubjectKeyIdentifier extension of this certificate. Missing if no corresponding extension is present.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "example": "ee4d4df8a73da63b0bcd4bf563f490d0cbbccc8f"
+          },
+          "stdKeyID": {
+            "description": "The standardized KeyID calculated as the SHA-1 hash over the public key info of this certificate.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "example": "ee4d4df8a73da63b0bcd4bf563f490d0cbbccc8f"
+          },
+          "issued": {
+            "description": "The moment in time when this certificate was issued.",
+            "type": "string",
+            "format": "date-time",
+            "example": "2020-09-25T18:13:42Z"
+          },
+          "start": {
+            "description": "The moment in time when this certificate becomes valid.",
+            "type": "string",
+            "format": "date-time",
+            "example": "2020-09-25T18:03:42Z"
+          },
+          "end": {
+            "description": "The moment in time when this certificate expires.",
+            "type": "string",
+            "format": "date-time",
+            "example": "2021-09-25T18:03:42Z"
+          },
+          "validity": {
+            "description": "The duration for which this certificate is valid.",
+            "type": "string",
+            "example": "12w6d"
+          },
+          "remainingDays": {
+            "description": "The integral number of remaining full 24h days for which this certificate is still valid. Note that when this field reports zero days, the certificate might still be valid for a couple of hours, i.e. the returned number of days are _at least_ that many full days of 24 hours.",
+            "type": "integer",
+            "example": "37"
+          },
+          "revoked": {
+            "description": "The moment in time when this certificate was revoked.",
+            "type": "string",
+            "format": "date-time",
+            "example": "2020-09-27T21:17:34Z"
+          },
+          "trusted": {
+            "description": "The moment in time up to when this certificate is/was trusted.",
+            "type": "string",
+            "format": "date-time",
+            "example": "2020-09-27T21:17:34Z"
+          }
+        }
+      },
+      "CertificateRejectionRequest": {
+        "description": "Certificate rejection request properties.",
+        "type": "object",
+        "properties": {
+          "message": {
+            "description": "The status message to describe the reason for rejection.",
+            "type": "string",
+            "maxLength": 1024,
+            "example": "missing mandatory extension with OID: 1.2.3.4"
+          }
+        }
+      },
+      "CertificateRequestBase": {
+        "description": "Data for requesting a certificate.",
+        "type": "object",
+        "properties": {
+          "proto": {
+            "description": "The enrollment protocol that shall be recorded for this certificate.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EnrollmentProtocol"
+              }
+            ],
+            "default": "REST"
+          },
+          "session": {
+            "description": "The enrollment session ID. When given, must refer to an existing enrollment session for validation.",
+            "type": "string"
+          },
+          "commonName": {
+            "description": "The common name (CN) for the certificate.",
+            "type": "string"
+          },
+          "mail": {
+            "description": "The DN e-mail address for the certificate.",
+            "type": "string"
+          },
+          "dnSuffix": {
+            "description": "The DN suffix for the certificate.",
+            "type": "string"
+          },
+          "SAN": {
+            "description": "The desired SubjectAlternativeNames (SANs).",
+            "type": "object",
+            "properties": {
+              "DNS": {
+                "description": "The DNS SANs.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "mail": {
+                "description": "The RFC 822 mail SANs.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "IP": {
+                "description": "The IP address SANs.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "URI": {
+                "description": "The URI SANs.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "dir": {
+                "description": "The directory name SANs.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "OID": {
+                "description": "The registered OID SANs.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "GUID": {
+                "description": "The DomainController GUID SAN.",
+                "type": "string",
+                "example": "5e805e18-150a-497f-84c9-35ba734173ea"
+              },
+              "principalName": {
+                "description": "The NT Principal Name SAN.",
+                "type": "string",
+                "example": "workstation768$"
+              }
+            }
+          },
+          "SID": {
+            "description": "The object SID for the user from Active Directory in its string form.",
+            "type": "string",
+            "example": "S-1-5-21-543965482-1004679632-2911664319-1111$"
+          },
+          "validityStart": {
+            "description": "The desired validity start. Might get adjusted to what is specified in the template to honor its limits.",
+            "type": "string",
+            "format": "date-time",
+            "example": "2021-12-12T23:05:02Z"
+          },
+          "validity": {
+            "description": "The desired validity duration. Might get adjusted to what is specified in the template to honor its limits.",
+            "type": "string",
+            "example": "60d"
+          },
+          "returnIssuer": {
+            "description": "Whether to return the direct issuer CA certificate",
+            "type": "boolean",
+            "default": true
+          },
+          "returnChain": {
+            "description": "Whether to return any additional intermediate CA certificates, different from the direct issuer CA and the root CA",
+            "type": "boolean",
+            "default": true
+          },
+          "returnRoot": {
+            "description": "Whether to return the root CA certificate. Note that if the issuer is a root CA, it will be necessary to return the issuer certificate instead.",
+            "type": "boolean",
+            "default": false
+          },
+          "format": {
+            "description": "The desired format of returned data.",
+            "default": "DER",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RawDataEncodingKind"
+              }
+            ]
+          },
+          "notify": {
+            "description": "The e-mail address of someone to notify upon completion.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "example": "webmaster@acme.org"
+          },
+          "renew": {
+            "description": "The old certificate to be renewed",
+            "type": "string",
+            "maxLength": 65536,
+            "format": "byte",
+            "example": "Base64(-----BEGIN CERTIFICATE-----\n....\n-----END CERTIFICATE-----)"
+          },
+          "input": {
+            "description": "Additional arbitrary optional input data.",
+            "type": "string",
+            "example": "{'foo':'bar','input-override':'some-value'}"
+          }
+        }
+      },
+      "CertificateRequestGen": {
+        "description": "Data for requesting a certificate without a CSR.",
+        "allOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "description": "The kind of key to generate.",
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/KeyPairKind"
+                  }
+                ]
+              },
+              "ecCurve": {
+                "description": "The desired elliptic curve name for EC keys. May only be specified for EC keys.",
+                "type": "string",
+                "maxLength": 64,
+                "example": "secp256r1"
+              },
+              "size": {
+                "description": "The size of the key to generate. When given in combination with the EC curve name or a PQC kind with fixed key size, both must match.",
+                "type": "integer",
+                "example": "2048"
+              }
+            }
+          },
+          {
+            "$ref": "#/components/schemas/CertificateRequestBase"
+          }
+        ],
+        "required": [
+          "kind"
+        ]
+      },
+      "CertificateRequestSign": {
+        "description": "Data for requesting a certificate with a CSR.",
+        "allOf": [
+          {
+            "type": "object",
+            "properties": {
+              "csr": {
+                "description": "The PKCS#10 certificate signing request (CSR). The JSON encoding requires this to be in Base64 form, so if PEM should be sent (i.e. with BEGIN/END header/footer lines), it will in effect be doubly Base64-encoded. Therefore it is recommended to directly pass the binary DER encoding in Base64-encoded form to JSON. If PEM is used, however, there is no explicit restriction on any line length of its Base64 encoded inner block between the BEGIN/END lines: any line length will be accepted, as long as it is on a separate line, distinct from the BEGIN/END delimiter lines (even a single long line is allowed).",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536,
+                "format": "byte",
+                "example": "Base64(-----BEGIN CERTIFICATE REQUEST-----\n....\n-----END CERTIFICATE REQUEST-----)"
+              }
+            }
+          },
+          {
+            "$ref": "#/components/schemas/CertificateRequestBase"
+          }
+        ],
+        "required": [
+          "csr"
+        ]
+      },
+      "CertificateStatus": {
+        "description": "Certificate lifecycle state.",
+        "type": "string",
+        "enum": [
+          "ACTIVE",
+          "EXPIRED",
+          "REVOKED",
+          "SUSPENDED",
+          "RETIRED"
+        ]
+      },
+      "CertificateStatusRequest": {
+        "description": "Simple container for getting the status of a certificate by serial number.",
+        "type": "object",
+        "properties": {
+          "serial": {
+            "description": "The (decimal) serial number of the certificate to get the status for.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "example": "2722167074769394176"
+          }
+        },
+        "required": [
+          "serial"
+        ]
+      },
+      "CertificateValidity": {
+        "description": "Certificate validity status.",
+        "type": "string",
+        "enum": [
+          "INCUBATING",
+          "ALIVE",
+          "EXPIRED"
+        ]
+      },
+      "EnrollmentProtocol": {
+        "description": "The supported enrollment protocols for certificates.",
+        "type": "string",
+        "enum": [
+          "ACME",
+          "AUTO",
+          "EST",
+          "EXTERNAL",
+          "LCEP",
+          "REST",
+          "SCEP",
+          "MAIL",
+          "MANUAL",
+          "PRINTER"
+        ]
+      },
+      "ErrorInfo": {
+        "description": "Information about an error with possibly nested causes.",
+        "type": "object",
+        "properties": {
+          "msg": {
+            "description": "The error message.",
+            "type": "string",
+            "minLength": 1,
+            "example": "a generic failure message"
+          },
+          "cause": {
+            "description": "The (optional) cause of the error.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ErrorInfo"
+              }
+            ]
+          }
+        },
+        "required": [
+          "msg"
+        ]
+      },
+      "FetchPendingRequest": {
+        "description": "Simple container for fetching a pending certificate by UUID.",
+        "type": "object",
+        "properties": {
+          "uuid": {
+            "description": "The UUID of the pending certificate request.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "example": "e49d6c1f-f669-4648-ac3d-7a0578f84577"
+          }
+        },
+        "required": [
+          "uuid"
+        ]
+      },
+      "IssuancePendingResponseData": {
+        "description": "Information about a pending certificate issuance.",
+        "type": "object",
+        "properties": {
+          "status": {
+            "description": "The status of the request.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RequestStatus"
+              }
+            ]
+          },
+          "uuid": {
+            "description": "The unique ID to access the request again later.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "example": "e49d6c1f-f669-4648-ac3d-7a0578f84577"
+          },
+          "msg": {
+            "description": "An informational message, e.g. a hint about approval.",
+            "type": "string",
+            "example": "CSR is awaiting approval."
+          }
+        },
+        "required": [
+          "status",
+          "uuid"
+        ]
+      },
+      "IssuedCertificateData": {
+        "description": "Meta information and data of an issued certificate.",
+        "type": "object",
+        "properties": {
+          "info": {
+            "description": "The meta information of the issued certificate.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CertificateMeta"
+              }
+            ]
+          },
+          "uuid": {
+            "description": "The unique ID to access the request again later.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "example": "e49d6c1f-f669-4648-ac3d-7a0578f84577"
+          },
+          "key": {
+            "description": "The key in the requested format.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536,
+            "format": "byte",
+            "example": "Base64(-----BEGIN RSA PRIVATE KEY-----....-----END RSA PRIVATE KEY-----)"
+          },
+          "cert": {
+            "description": "The requested certificate in the requested format.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536,
+            "format": "byte",
+            "example": "Base64(-----BEGIN CERTIFICATE-----....-----END CERTIFICATE-----)"
+          },
+          "issuer": {
+            "description": "The direct issuer CA certificate in the requested format. If this is a root CA certificate, it will _not_ be repeated in the 'root' field below.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536,
+            "format": "byte",
+            "example": "Base64(-----BEGIN CERTIFICATE-----....-----END CERTIFICATE-----)"
+          },
+          "chain": {
+            "description": "The chain of additional intermediate CA certificates, different from the direct issuer CA and the root CA, in the requested format.",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 65536,
+              "format": "byte",
+              "example": "Base64(-----BEGIN CERTIFICATE-----....-----END CERTIFICATE-----)"
+            }
+          },
+          "root": {
+            "description": "The root CA certificate in the requested format. Might not be present even when requested, in case the issuer is a root CA itself.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536,
+            "format": "byte",
+            "example": "Base64(-----BEGIN CERTIFICATE-----....-----END CERTIFICATE-----)"
+          }
+        },
+        "required": [
+          "info",
+          "uuid",
+          "cert"
+        ]
+      },
+      "KeyPairFamily": {
+        "description": "Key pair family.",
+        "type": "string",
+        "enum": [
+          "UNKNOWN",
+          "DH",
+          "DSA",
+          "EC",
+          "RSA",
+          "ML_DSA",
+          "FN_DSA",
+          "ML_KEM",
+          "SLH_DSA"
+        ]
+      },
+      "KeyPairGroup": {
+        "description": "Key pair group.",
+        "type": "string",
+        "enum": [
+          "UNKNOWN",
+          "DH",
+          "DSA",
+          "EC",
+          "RSA",
+          "ML_DSA",
+          "ML_DSA_HASH",
+          "FN_DSA",
+          "FN_DSA_HASH",
+          "ML_KEM",
+          "SLH_DSA_SHA2_S",
+          "SLH_DSA_SHA2_F",
+          "SLH_DSA_SHAKE_S",
+          "SLH_DSA_SHAKE_F",
+          "SLH_DSA_SHA2_S_HASH",
+          "SLH_DSA_SHA2_F_HASH",
+          "SLH_DSA_SHAKE_S_HASH",
+          "SLH_DSA_SHAKE_F_HASH"
+        ]
+      },
+      "KeyPairKind": {
+        "description": "Key pair kind.",
+        "type": "string",
+        "enum": [
+          "EC",
+          "RSA",
+          "ML_DSA_44",
+          "ML_DSA_65",
+          "ML_DSA_87",
+          "ML_DSA_44_SHA512",
+          "ML_DSA_65_SHA512",
+          "ML_DSA_87_SHA512",
+          "FN_DSA_512",
+          "FN_DSA_1024",
+          "SLH_DSA_SHA2_128_S",
+          "SLH_DSA_SHA2_128_F",
+          "SLH_DSA_SHA2_192_S",
+          "SLH_DSA_SHA2_192_F",
+          "SLH_DSA_SHA2_256_S",
+          "SLH_DSA_SHA2_256_F",
+          "SLH_DSA_SHAKE_128_S",
+          "SLH_DSA_SHAKE_128_F",
+          "SLH_DSA_SHAKE_192_S",
+          "SLH_DSA_SHAKE_192_F",
+          "SLH_DSA_SHAKE_256_S",
+          "SLH_DSA_SHAKE_256_F",
+          "SLH_DSA_SHA2_128_S_SHA256",
+          "SLH_DSA_SHA2_128_F_SHA256",
+          "SLH_DSA_SHA2_192_S_SHA512",
+          "SLH_DSA_SHA2_192_F_SHA512",
+          "SLH_DSA_SHA2_256_S_SHA512",
+          "SLH_DSA_SHA2_256_F_SHA512",
+          "SLH_DSA_SHAKE_128_S_SHAKE128",
+          "SLH_DSA_SHAKE_128_F_SHAKE128",
+          "SLH_DSA_SHAKE_192_S_SHAKE256",
+          "SLH_DSA_SHAKE_192_F_SHAKE256",
+          "SLH_DSA_SHAKE_256_S_SHAKE256",
+          "SLH_DSA_SHAKE_256_F_SHAKE256"
+        ]
+      },
+      "KeyStorage": {
+        "description": "Key storage.",
+        "type": "string",
+        "enum": [
+          "UNKNOWN",
+          "EPHEMERAL",
+          "SOFTWARE",
+          "HARDWARE"
+        ]
+      },
+      "NameList": {
+        "description": "A list of names.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "Privilege": {
+        "description": "Available system privileges for user authorization.",
+        "type": "string",
+        "enum": [
+          "TENANT_ADMIN",
+          "SYSTEM_ADMIN",
+          "SYSTEM_EXECUTION",
+          "CUSTOMER_ACCESS",
+          "CUSTOMER_ADMIN",
+          "QUOTA_ACCESS",
+          "QUOTA_ADMIN",
+          "LOOKUP_ACCESS",
+          "LOOKUP_ADMIN",
+          "LICENSE_ADMIN",
+          "LANGUAGE_ADMIN",
+          "DEPARTMENT_ACCESS",
+          "DEPARTMENT_ADMIN",
+          "NOTIFICATION_TEMPLATE_ACCESS",
+          "NOTIFICATION_TEMPLATE_ADMIN",
+          "GROUP_ACCESS",
+          "GROUP_ADMIN",
+          "USER_ACCESS",
+          "USER_ADMIN",
+          "USER_LIST",
+          "SYSTEM_AUDIT_ACCESS",
+          "SYSTEM_AUDIT_ADMIN",
+          "SYSTEM_GROUP_ADMIN",
+          "SYSTEM_JOB_ADMIN",
+          "SYSTEM_LDAP_ADMIN",
+          "SYSTEM_MAIL_ADMIN",
+          "SYSTEM_MESSAGE_ADMIN",
+          "CA_ACCESS",
+          "CA_ADMIN",
+          "SHARED_SECRET_ACCESS",
+          "SHARED_SECRET_ADMIN",
+          "KEY_HANDLE_ACCESS",
+          "KEY_HANDLE_ADMIN",
+          "TRUST_STORE_ACCESS",
+          "TRUST_STORE_ADMIN",
+          "TEMPLATE_ACCESS",
+          "TEMPLATE_ADMIN",
+          "VALIDATION_SCHEMA_ACCESS",
+          "VALIDATION_SCHEMA_ADMIN",
+          "WORKFLOW_ACCESS",
+          "WORKFLOW_ADMIN",
+          "WORKFLOW_OPERATE",
+          "PUBLISHER_ADMIN",
+          "NOTIFICATION_ACCESS",
+          "NOTIFICATION_SEND",
+          "NOTIFICATION_ADMIN",
+          "NOTIFICATION_PROCESS",
+          "SYSTEM_STATUS_ACCESS",
+          "USER_STATS_ACCESS",
+          "USER_STATS_ADMIN",
+          "MULTI_DEPARTMENT_DATA_ACCESS",
+          "SENSITIVE_DATA_ACCESS",
+          "FOREIGN_DATA_ACCESS",
+          "ENROLLMENT_ADMIN",
+          "ENROLLMENT_PREPARE",
+          "ACME_ADMIN",
+          "CERTIFICATE_APPROVE",
+          "CERTIFICATE_UPLOAD",
+          "CERTIFICATE_ACCESS",
+          "CERTIFICATE_SEARCH",
+          "CERTIFICATE_DEVICE_ADMIN",
+          "CERTIFICATE_SEARCH_ADMIN",
+          "CERTIFICATE_ISSUE",
+          "CERTIFICATE_ENROLL",
+          "CERTIFICATE_REVOKE",
+          "CERTIFICATE_MODIFY",
+          "CERTIFICATE_DELETE"
+        ]
+      },
+      "RawDataEncodingKind": {
+        "description": "Encoding kind of returned raw data.",
+        "type": "string",
+        "enum": [
+          "DER",
+          "PEM"
+        ]
+      },
+      "RequestStatus": {
+        "description": "Possible states of certificate requests.",
+        "type": "string",
+        "enum": [
+          "FRESH",
+          "SUBMITTING",
+          "ABORTED",
+          "PENDING",
+          "APPROVED",
+          "ISSUED",
+          "FAILED",
+          "DENIED"
+        ]
+      },
+      "RevocationReason": {
+        "description": "Certificate revocation reason.",
+        "type": "string",
+        "enum": [
+          "UNSPECIFIED",
+          "KEY_COMPROMISE",
+          "CA_COMPROMISE",
+          "AFFILIATION_CHANGED",
+          "SUPERSEDED",
+          "CESSATION_OF_OPERATION",
+          "CERTIFICATE_HOLD",
+          "REMOVE_FROM_CRL",
+          "PRIVILEGE_WITHDRAWN",
+          "AA_COMPROMISE"
+        ]
+      },
+      "RevocationRequest": {
+        "description": "Simple container for revoking a certificate by serial number.",
+        "type": "object",
+        "properties": {
+          "serial": {
+            "description": "The (decimal) serial number of the certificate to revoke.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "example": "2722167074769394176"
+          },
+          "reason": {
+            "description": "The reason why this certificate should be revoked. UNSPECIFIED will be used when not given.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RevocationReason"
+              }
+            ]
+          },
+          "endOfTrust": {
+            "description": "The instant in time up to when this certificate is considered trusted. When not given, the revocation time (when making this call) will be used, unless that is not within the certificate's validity period, in which case the start of that period will be used instead.",
+            "type": "string",
+            "format": "date-time",
+            "example": "2021-12-12T23:05:02Z"
+          }
+        },
+        "required": [
+          "serial"
+        ]
+      },
+      "SAN": {
+        "description": "Subject alternative name (SAN).",
+        "type": "object",
+        "properties": {
+          "kind": {
+            "description": "The kind of this SAN.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SANKind"
+              }
+            ],
+            "example": "DNS_NAME"
+          },
+          "name": {
+            "description": "The name of this SAN. Syntax depends on the kind.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "example": "www.intellicard.ch"
+          }
+        },
+        "required": [
+          "kind",
+          "name"
+        ]
+      },
+      "SANKind": {
+        "description": "The Supported kinds of Subject Alternative Names (SANs).",
+        "type": "string",
+        "enum": [
+          "OTHER_GENERIC",
+          "RFC822_NAME",
+          "DNS_NAME",
+          "X400_ADDRESS",
+          "DIRECTORY_NAME",
+          "EDI_PARTY_NAME",
+          "URI",
+          "REGISTERED_ID",
+          "OTHER_UPN",
+          "OTHER_GUID"
+        ]
+      },
+      "SystemLanguage": {
+        "description": "Available system languages.",
+        "type": "string",
+        "enum": [
+          "EN",
+          "DE"
+        ]
+      },
+      "UserLoginRequest": {
+        "description": "The data identifying a user during login.",
+        "type": "object",
+        "properties": {
+          "user": {
+            "description": "The user name.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "example": "jdo"
+          }
+        },
+        "required": [
+          "user"
+        ]
+      }
+    },
+    "examples": {
+      "ErrorInfoExample": {
+        "description": "An error with nested causes.",
+        "value": {
+          "msg": "A backend error occurred.",
+          "cause": {
+            "msg": "The given username parameter is invalid.",
+            "cause": {
+              "msg": "Argument may not be null.",
+              "cause": {
+                "msg": "OpenAPI examples don't get expanded properly when referenced from other locations ... hence we don't use them here."
+              }
+            }
+          }
+        }
+      },
+      "SimpleErrorExample": {
+        "description": "A simple, single error.",
+        "value": {
+          "msg": "An unexpected error occurred."
+        }
+      }
+    }
+  }
+}
