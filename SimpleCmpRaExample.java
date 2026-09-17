@@ -2,14 +2,16 @@ import com.siemens.pki.cmpracomponent.configuration.*;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent.CmpRaInterface;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent.UpstreamExchange;
+import com.siemens.pki.cmpracomponent.persistency.DefaultPersistencyImplementation;
 import com.siemens.pki.cmpracomponent.cryptoservices.CertUtility;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.FileInputStream;
 import java.security.KeyStore;
+import java.security.PrivateKey;
 import java.security.cert.X509Certificate;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 
@@ -33,8 +35,6 @@ import java.util.List;
  */
 public class SimpleCmpRaExample {
     
-    private static final Logger LOGGER = LoggerFactory.getLogger(SimpleCmpRaExample.class);
-    
     public static void main(String[] args) throws Exception {
         System.out.println("=== CMP RA Component Example ===\n");
         
@@ -52,16 +52,9 @@ public class SimpleCmpRaExample {
         // Step 4: Use the RA component to process CMP requests
         // In a real application, this would be called by your HTTP/CoAP server
         // when receiving requests from end entities
-        
         System.out.println("The RA component is now ready to process CMP requests.");
-        System.out.println("Call raComponent.processRequest(requestBytes) to process incoming CMP requests.\n");
-        
-        // Example of processing a request (pseudo-code):
-        // byte[] cmpRequestFromEE = ... // received from network
-        // byte[] cmpResponseToEE = raComponent.processRequest(cmpRequestFromEE);
-        // sendResponseToEE(cmpResponseToEE);
-        
-        demonstrateUsage(raComponent);
+        System.out.println("Call raComponent.processRequest(requestBytes) with incoming CMP messages.");
+        System.out.println("\n=== Example Complete ===");
     }
     
     /**
@@ -171,7 +164,7 @@ public class SimpleCmpRaExample {
                             String requestedSubjectDn,
                             byte[] pkiMessage) {
                         
-                        LOGGER.info("Processing certificate request for: {}", requestedSubjectDn);
+                        System.out.println("Processing certificate request for: " + requestedSubjectDn);
                         
                         // Here you could:
                         // 1. Check if the requester is authorized
@@ -208,7 +201,7 @@ public class SimpleCmpRaExample {
                             String serialNumber,
                             String subjectDN,
                             String issuerDN) {
-                        LOGGER.info("Certificate issued: {} (SN: {})", subjectDN, serialNumber);
+                        System.out.println("Certificate issued: " + subjectDN + " (SN: " + serialNumber + ")");
                         return true;
                     }
                 };
@@ -218,7 +211,7 @@ public class SimpleCmpRaExample {
             public PersistencyInterface getPersistency() {
                 // Optional: Persistency for delayed delivery support
                 // Allows RA to survive restarts during long-running transactions
-                return new DefaultPersistencyImplementation();
+                return DefaultPersistencyImplementation.getInstance();
             }
             
             @Override
@@ -301,9 +294,9 @@ public class SimpleCmpRaExample {
                     }
                     
                     @Override
-                    public java.security.cert.Certificate[] getCertificateChain() {
+                    public List<X509Certificate> getCertificateChain() {
                         // Return certificate chain from keystore
-                        return null; // Placeholder
+                        return Collections.emptyList(); // Placeholder
                     }
                 };
             }
@@ -314,25 +307,15 @@ public class SimpleCmpRaExample {
                 System.out.println("  - Loading trust anchors from: " + rootCaPath);
                 return new VerificationContext() {
                     @Override
-                    public List<X509Certificate> getTrustAnchors() {
+                    public Collection<X509Certificate> getTrustedCertificates() {
                         // Return list of trusted root certificates
                         return Collections.emptyList(); // Placeholder
                     }
                     
                     @Override
-                    public List<X509Certificate> getIntermediateCertificates() {
+                    public Collection<X509Certificate> getAdditionalCerts() {
                         // Return intermediate certificates if needed
                         return Collections.emptyList(); // Placeholder
-                    }
-                    
-                    @Override
-                    public CrlUpdateRetrievalHandler getCrlUpdateRetrievalHandler() {
-                        return null; // No CRL checking in this example
-                    }
-                    
-                    @Override
-                    public boolean isCheckRevocation() {
-                        return false; // Disable revocation checking for simplicity
                     }
                 };
             }

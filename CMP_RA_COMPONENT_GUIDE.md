@@ -28,20 +28,101 @@ The CMP RA component supports:
 
 ## Architecture
 
+### Single Interface Design
+
+For simplicity, the CMP RA component provides:
+- **One downstream interface** towards clients (End Entities)
+- **One upstream interface** towards the server (CA)
+
+If you need multiple interfaces:
+- **Different transport/routing**: Achieved by your embedding application multiplexing channels
+- **Different message protection or inventory behavior**: Achieved via the certificate profile mechanism
+- **Different CMP/application-level processing**: Requires multiple RA instances
+
+### Message Format
+
+All messages are exchanged as **ASN.1 DER-encoded byte strings**, including:
+- CMP messages (PKIMessage)
+- PKCS#10 certificate requests
+- X.509 certificates and structures
+
+**Why byte strings?**
+- The transfer layer typically does **not** need to look into the contents of request/response messages
+- Messages can be forwarded and returned as **opaque data**
+- Byte-string level is the **least common denominator** for representing PKIX-related data structures
+- This approach avoids the error-prone handling of inadequate class definitions provided by the standard Java RE
+
+### Transport Layer Responsibilities
+
+Your embedding application's transport layer is responsible for:
+
 ```
-┌─────────────┐         ┌──────────────────┐         ┌─────────────┐
-│ End Entity  │◄───────►│   CMP RA         │◄───────►│    CA       │
-│ (EE)        │  Down-  │   Component      │  Up-    │ (Certificate│
-│             │  stream │                  │  stream │  Authority) │
-└─────────────┘         └──────────────────┘         └─────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                    Your RA Server Application                    │
+│                                                                  │
+│  ┌──────────────┐                                               │
+│  │   Client     │◄──── Extract request from client              │
+│  │   (EE)       │                                               │
+│  └──────┬───────┘                                               │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │           Transport Layer (Your Code)                     │   │
+│  │                                                            │   │
+│  │  1. Extract request from client                           │   │
+│  │     → Feed to RA downstream interface                     │   │
+│  │                                                            │   │
+│  │  2. Forward request from RA upstream interface            │   │
+│  │     → Send to CA server                                   │   │
+│  │                                                            │   │
+│  │  3. Collect response from CA server                       │   │
+│  │     → Provide to RA upstream interface                    │   │
+│  │                                                            │   │
+│  │  4. Take response from RA downstream interface            │   │
+│  │     → Return to client                                    │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌──────────────┐                                               │
+│  │   RA         │ ◄─── CMP RA Component                         │
+│  │   Component  │                                               │
+│  └──────────────┘                                               │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌──────────────┐                                               │
+│  │   Server     │                                               │
+│  │   (CA)       │                                               │
+│  └──────────────┘                                               │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Message Flow
+**In code, this looks like:**
 
-1. **Downstream** (EE → RA): EE sends CMP request to RA
-2. **Processing**: RA validates, optionally modifies, and authorizes request
-3. **Upstream** (RA → CA): RA forwards request to CA
-4. **Response**: CA responds, RA processes and forwards back to EE
+```java
+// In your HTTP/CoAP/TCP server handler
+public byte[] handleClientRequest(byte[] clientRequest) throws Exception {
+    // Step 1: Feed request to RA downstream interface
+    byte[] raResponse = raComponent.processRequest(clientRequest);
+    
+    // Step 4: Return response to client
+    return raResponse;
+}
+
+// In your CA client code (inside UpstreamExchange implementation)
+private byte[] sendToCa(byte[] request) throws Exception {
+    // Step 2: Forward request to CA
+    HttpURLConnection conn = (HttpURLConnection) caUrl.openConnection();
+    conn.getOutputStream().write(request);
+    
+    // Step 3: Collect response from CA
+    byte[] caResponse = conn.getInputStream().readAllBytes();
+    
+    // Return to RA upstream interface (handled inside UpstreamExchange)
+    return caResponse;
+}
+```
+
+The RA component itself handles all CMP protocol logic internally - your transport layer simply moves opaque byte arrays between endpoints.
 
 ---
 

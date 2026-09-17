@@ -1,1 +1,27 @@
-Nothing should be ignored based on the provided file changes, as they only include source files (.md and .java) without any build artifacts, dependencies, or temporary files.
+```
+# Compiled and build artifacts
+*.class
+*.o
+*.obj
+*.out
+target/
+cmp-ra-component/target/
+
+# Dependencies
+.m2/
+.gradle/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Editors
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.local
+*.env.*
+```
