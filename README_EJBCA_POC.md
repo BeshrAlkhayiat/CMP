@@ -1,128 +1,225 @@
-# PoC: OpenSSL CMP to EJBCA Bridge
+# EJBCA CMP Bridge - Proof of Concept
 
-This Proof of Concept demonstrates how to use `openssl cmp` to send certificate requests (`p10cr` or `ir`) to an internal EJBCA test CMP endpoint using the Siemens CMP RA Component.
+## Overview
 
-## Architecture
+This PoC demonstrates how to use `openssl cmp` to send certificate requests (IR or P10CR) to an internal EJBCA test CMP endpoint using the Siemens CMP RA Component.
+
+## Architecture (Mode A - Pass-Through)
 
 ```
 [OpenSSL CMP Client] 
-       |
-       | (CMP over HTTP)
-       v
-[EjbcaCmpBridge] <--- Local Java HTTP Server (Port 8080)
-       |
-       | (CMP over HTTP - Pass Through)
-       v
-[EJBCA CA Server] <--- Your Internal Test Endpoint
+        |
+        | CMP over HTTP (port 8080)
+        v
+[EjbcaCmpBridge - RA Component]
+        |
+        | CMP over HTTP POST
+        v
+[EJBCA CMP Server]
 ```
 
-**Mode:** This implementation uses **Mode A (Pass-Through)**. The RA component does not translate protocols; it validates the incoming CMP message and forwards the raw ASN.1 bytes to EJBCA, then returns the raw response.
-
-## Prerequisites
-
-1.  **Java 11+** (for `java.net.http.HttpClient`)
-2.  **Maven** (to build the project)
-3.  **OpenSSL 3.0+** (with CMP support enabled)
-4.  **Running EJBCA Instance** with a CMP alias configured.
+The bridge acts as a **pass-through RA** (Mode A):
+- Accepts CMP messages from OpenSSL on localhost:8080
+- Forwards raw ASN.1-encoded CMP bytes to EJBCA via HTTP POST
+- Returns EJBCA's response back to OpenSSL
+- All CMP protocol handling is done by the RA Component
 
 ## Configuration Mapping
 
-The code maps the parameters from your `CABackendParams-Kind-CMP.txt` file as follows:
+Based on your `CABackendParams-Kind-CMP.txt`:
 
-| Parameter File Setting | Code Implementation | Value Used in PoC |
-| :--- | :--- | :--- |
-| `CMP.EndpointAddress` | Constructor Arg 1 | Passed at runtime |
-| `AuthenticationSharedSecret` | Constructor Arg 2 | Passed at runtime |
-| `CMP.Sender.KID` | Constructor Arg 3 | Optional |
-| `CMP.HashAlgorithm` | `.setHashAlgorithm()` | **SHA256** (Upgraded from default SHA1) |
-| `CMP.Dialect` | `.setDialect()` | **EJBCA** |
-| `CMP.ImplicitConfirm` | `.setImplicitConfirm()` | **false** |
-| `CMP.ProtocolVersion` | `.setProtocolVersion()` | **cmp2000** |
+| Parameter | Value | Location |
+|-----------|-------|----------|
+| `CMP.EndpointAddress` | EJBCA URL | Command line argument |
+| `AuthenticationSharedSecret` | Shared secret | Command line argument |
+| `CMP.Sender.KID` | Key ID | Command line argument |
+| `CMP.HashAlgorithm` | SHA256 | Hardcoded in config |
+| `CMP.ImplicitConfirm` | false | Hardcoded in config |
+| `CMP.HashMinRounds` | 5000 | Hardcoded in config |
+| `CMP.HashSaltSize` | 32 bytes | Hardcoded in config |
+| `CMP.Dialect` | EJBCA | Handled automatically |
 
-## Step 1: Build the Project
+## Prerequisites
 
-Navigate to the workspace and compile the Java files. You will need the Siemens CMP RA library and BouncyCastle on the classpath.
+1. Java 11+
+2. Bouncy Castle libraries (included in `cmp-ra-component/target/lib/`)
+3. OpenSSL with CMP support (`openssl cmp` command)
+4. Running EJBCA instance with CMP endpoint enabled
 
-Assuming you have the necessary JARs in a `lib/` folder or via Maven:
+## Build
 
 ```bash
-# Compile the bridge
-javac -cp "cmp-ra-component/target/*:lib/*" EjbcaCmpBridge.java
+cd /workspace
+javac -cp "cmp-ra-component/target/CmpRaComponent-4.3.0.jar:cmp-ra-component/target/lib/*" EjbcaCmpBridge.java
 ```
 
-## Step 2: Run the Bridge
-
-Start the bridge application, pointing it to your EJBCA instance.
+## Run
 
 ```bash
-# Syntax: java -cp ".:lib/*" EjbcaCmpBridge <EJBCA_URL> <SHARED_SECRET> [SENDER_KID]
-
-java -cp ".:lib/*" EjbcaCmpBridge \
-  "http://localhost:8080/ejbca/publicweb/cmp/myalias" \
-  "myTopSecretPassword" \
+java -cp ".:cmp-ra-component/target/CmpRaComponent-4.3.0.jar:cmp-ra-component/target/lib/*" \
+  EjbcaCmpBridge \
+  "http://your-ejbca-server:8080/ejbca/publicweb/cmp/myalias" \
+  "mySharedSecret" \
   "myKeyId"
 ```
 
-*   **EJBCA_URL**: The full URL to your EJBCA CMP servlet (e.g., `/ejbca/publicweb/cmp/<alias>`).
-*   **SHARED_SECRET**: The reference password configured in EJBCA for this CMP alias.
-*   **SENDER_KID**: (Optional) The Key ID if your EJBCA setup requires it for shared secret lookup.
+Example output:
+```
+EJBCA CMP Bridge initialized
+  EJBCA URL: http://your-ejbca-server:8080/ejbca/publicweb/cmp/myalias
+  Downstream port: 8080
+  Downstream path: /cmp
+  Hash Algorithm: SHA256
+  Implicit Confirm: false
+  Hash Rounds: 5000
+  Salt Size: 32 bytes
 
-The application will start a local server on **http://localhost:8080/cmp**.
+EJBCA CMP Bridge started on port 8080
+Ready to accept CMP requests at http://localhost:8080/cmp
 
-## Step 3: Send Requests with OpenSSL
+Example OpenSSL commands:
+  # Initialize Request (IR):
+  openssl cmp -server http://localhost:8080/cmp \
+    -cacerts ejbca_ca.pem -certout cert.pem -keyout key.pem \
+    -subject "/CN=TestUser/O=MyOrg" -ir \
+    -secret mySharedSecret -kid myKeyId -digest sha256
 
-Now, use `openssl cmp` to talk to your **local bridge** instead of talking directly to EJBCA.
+  # PKCS#10 Certificate Request (P10CR):
+  openssl cmp -server http://localhost:8080/cmp \
+    -cacerts ejbca_ca.pem -certout issued_cert.pem \
+    -p10cr user.csr \
+    -secret mySharedSecret -kid myKeyId -digest sha256
+```
 
-### Option A: Send an Initialization Request (IR)
-Use this for the very first request to get initial credentials.
+## Usage with OpenSSL
+
+### Option 1: Initialize Request (IR)
+
+Generate a new key and request a certificate:
 
 ```bash
+# First, export the CA certificate from EJBCA
 openssl cmp -server http://localhost:8080/cmp \
   -cacerts ejbca_ca.pem \
-  -certout new_cert.pem \
-  -keyout new_key.pem \
   -subject "/CN=TestUser/O=MyOrg" \
   -ir \
-  -secret myTopSecretPassword \
+  -secret mySharedSecret \
+  -kid myKeyId \
+  -digest sha256 \
+  -certout cert.pem \
+  -keyout key.pem
+```
+
+### Option 2: PKCS#10 Certificate Request (P10CR)
+
+If you already have a CSR:
+
+```bash
+# Generate a key and CSR first
+openssl genrsa -out user.key 2048
+openssl req -new -key user.key -out user.csr -subj "/CN=TestUser/O=MyOrg"
+
+# Submit the CSR via CMP
+openssl cmp -server http://localhost:8080/cmp \
+  -cacerts ejbca_ca.pem \
+  -certout issued_cert.pem \
+  -p10cr user.csr \
+  -secret mySharedSecret \
   -kid myKeyId \
   -digest sha256
 ```
 
-### Option B: Send a PKCS#10 Certificate Request (P10CR)
-Use this if you already have a key and CSR.
+## How It Works
 
-1.  **Generate Key and CSR first:**
-    ```bash
-    openssl genrsa -out user.key 2048
-    openssl req -new -key user.key -out user.csr -subj "/CN=TestUser/O=MyOrg"
-    ```
+### 1. Downstream Interface (OpenSSL → Bridge)
 
-2.  **Send the P10CR:**
-    ```bash
-    openssl cmp -server http://localhost:8080/cmp \
-      -cacerts ejbca_ca.pem \
-      -certout issued_cert.pem \
-      -p10cr user.csr \
-      -secret myTopSecretPassword \
-      -kid myKeyId \
-      -digest sha256
-    ```
+- OpenSSL sends CMP message to `http://localhost:8080/cmp`
+- Message is protected with MAC using shared secret
+- RA Component validates the MAC protection
+- Configuration: `getDownstreamConfiguration()`
 
-### Explanation of OpenSSL Flags:
-*   `-server`: Points to the **local bridge**, not EJBCA directly.
-*   `-secret` / `-kid`: Must match the arguments passed to the Java app. The bridge uses these to configure the RA Component's MAC protection.
-*   `-digest sha256`: Must match the `SHA256` setting in the Java code (per your requirements).
-*   `-ir` / `-p10cr`: The type of CMP request body to send.
+### 2. Upstream Interface (Bridge → EJBCA)
+
+- RA Component forwards the request via `UpstreamExchange.sendReceiveMessage()`
+- Our implementation makes HTTP POST to EJBCA URL
+- Request is reprotected with MAC for EJBCA
+- Configuration: `getUpstreamConfiguration()`
+
+### 3. Response Flow
+
+- EJBCA returns CMP response
+- Bridge forwards response to RA Component
+- RA Component processes and validates response
+- Response is sent back to OpenSSL
+
+## Key Classes
+
+### `EjbcaCmpBridge`
+Main class that:
+- Parses command-line arguments
+- Creates RA Component instance
+- Starts HTTP server on port 8080
+- Forwards requests to EJBCA
+
+### `EjbcConfiguration` (inner class)
+Implements `Configuration` interface:
+- Configures downstream (OpenSSL) interface
+- Configures upstream (EJBCA) interface
+- Sets MAC algorithm (HMAC-SHA256)
+- Sets hash parameters (iterations, salt)
+
+### `forwardToEjbca()` method
+Implements `UpstreamExchange`:
+- Makes HTTP POST to EJBCA
+- Returns raw CMP response bytes
+- Handles errors
 
 ## Troubleshooting
 
-1.  **"Connection Refused"**: Ensure the Java bridge is running and listening on port 8080.
-2.  **"MAC Verification Failed"**: Ensure the `-secret` and `-kid` in OpenSSL match the Java startup arguments exactly.
-3.  **"Bad Algorithm"**: Ensure `-digest sha256` is used in OpenSSL, matching the Java config.
-4.  **EJBCA Errors**: Check the EJBCA logs. The bridge simply forwards the bytes, so protocol errors usually originate at the CA.
+### "Connection refused"
+Make sure EJBCA is running and the URL is correct.
+
+### "MAC verification failed"
+Check that the shared secret and KID match between OpenSSL, bridge, and EJBCA.
+
+### "Certificate request rejected"
+Check EJBCA logs for validation errors. The certificate profile may have restrictions.
+
+### OpenSSL complains about CA certificates
+Export the CA certificate chain from EJBCA first:
+```bash
+openssl cmp -server http://localhost:8080/cmp \
+  -cacerts ca_certs.pem \
+  -genm \
+  -secret mySharedSecret \
+  -kid myKeyId
+```
+
+## Security Considerations
+
+⚠️ **This is a PoC - not production ready!**
+
+For production:
+1. Use TLS between bridge and EJBCA (HTTPS)
+2. Implement proper secret management (not command-line args)
+3. Add logging and monitoring
+4. Implement rate limiting
+5. Consider using signature-based protection instead of MAC
+6. Add certificate validation for EJBCA responses
+7. Implement proper error handling and retry logic
 
 ## Next Steps
 
-*   **Trust Anchors**: Currently, the PoC relies on Shared Secret (MAC) protection. For production, implement `TrustAnchor` loading in the Java code to validate EJBCA's signature on responses.
-*   **HTTPS**: The local bridge currently runs on HTTP. For production, enable SSL on the `HttpServer` or place it behind Nginx/Apache.
-*   **Logging**: Integrate a proper logging framework (SLF4J/Log4j) instead of `System.out.println`.
+1. Test with your EJBCA instance
+2. Adjust configuration as needed (hash algorithm, timeouts, etc.)
+3. Add TLS support for upstream connection
+4. Implement secret lookup by KID for multiple clients
+5. Add metrics and logging
+6. Consider adding persistence for polling support
+
+## References
+
+- [Siemens CMP RA Component Documentation](../README.md)
+- [Lightweight CMP Profile](https://tools.ietf.org/wg/lamps/draft-ietf-lamps-lightweight-cmp-profile/)
+- [EJBCA CMP Documentation](https://www.ejbca.org/docs)
+- [OpenSSL CMP Documentation](https://www.openssl.org/docs/man3.0/man1/openssl-cmp.html)
