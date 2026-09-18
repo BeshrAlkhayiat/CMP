@@ -1,19 +1,12 @@
 ```
-# Build artifacts
-build/
-*.jar
-*.war
-*.class
-
 # Dependencies
+target/
+.m2/
 .gradle/
-node_modules/
-lib/
 
 # Logs and temp files
 *.log
 *.tmp
-*.swp
 
 # Environment
 .env
@@ -23,9 +16,9 @@ lib/
 # Editors
 .vscode/
 .idea/
-*.iml
 
-# OS generated files
-.DS_Store
-Thumbs.db
+# Build artifacts
+*.class
+*.jar
+*.war
 ```
