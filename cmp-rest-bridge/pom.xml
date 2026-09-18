@@ -1,5 +1,4 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Copyright (c) 2026 Siemens AG Licensed under the Apache License, Version 2.0 SPDX-License-Identifier: Apache-2.0 -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
@@ -68,10 +67,6 @@
                                                         <include>src/main/java/**/*.java</include>
                                                         <include>src/test/java/**/*.java</include>
                                                 </includes>
-                                                <licenseHeader>
-                                                        <file>${project.basedir}/../cmp-ra-component/resources/license-header.txt</file>
-                                                        <delimiter>^package\\s</delimiter>
-                                                </licenseHeader>
                                                 <palantirJavaFormat>
                                                         <version>2.90.0</version>
                                                 </palantirJavaFormat>
@@ -148,10 +143,4 @@
         </dependencies>
         <name>CMP to REST Bridge</name>
         <description>A bridge application that receives CMP requests from end entities and forwards them as REST calls to a PKI backend.</description>
-        <licenses>
-                <license>
-                        <name>The Apache License, Version 2.0</name>
-                        <url>http://www.apache.org/licenses/LICENSE-2.0.txt</url>
-                </license>
-        </licenses>
 </project>

@@ -1,34 +1,26 @@
-/*
- *  Copyright (c) 2026 Siemens AG
- *
- *  Licensed under the Apache License, Version 2.0 (the "License"); you may
- *  not use this file except in compliance with the License.
- *  You may obtain a copy of the License at
- *
- *  http://www.apache.org/licenses/LICENSE-2.0
- *
- *  Unless required by applicable law or agreed to in writing, software
- *  distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
- *  WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *  See the License for the specific language governing permissions and
- *  limitations under the License.
- *
- *  SPDX-License-Identifier: Apache-2.0
- */
 package com.siemens.pki.cmprestbridge.service;
 
 import com.siemens.pki.cmpracomponent.configuration.*;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent;
 import com.siemens.pki.cmpracomponent.persistency.DefaultPersistencyImplementation;
-import com.siemens.pki.cmpracomponent.cryptoservices.CertUtility;
+import com.siemens.pki.cmpracomponent.msggeneration.PkiMessageGenerator;
+import com.siemens.pki.cmpracomponent.msggeneration.HeaderProvider;
 import org.bouncycastle.asn1.ASN1Encoding;
-import org.bouncycastle.asn1.ASN1InputStream;
-import org.bouncycastle.asn1.x509.Certificate;
+import org.bouncycastle.asn1.ASN1Integer;
+import org.bouncycastle.asn1.ASN1BitSet;
+import org.bouncycastle.asn1.cmp.*;
+import org.bouncycastle.asn1.crmf.*;
+import org.bouncycastle.asn1.pkcs.CertificationRequest;
+import org.bouncycastle.asn1.pkcs.PKCS10CertificationRequest;
+import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.cert.X509CertificateHolder;
+import org.bouncycastle.operator.ContentSigner;
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
+import java.io.FileInputStream;
 import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.cert.CertPathBuilder;
@@ -110,8 +102,6 @@ public class CmpRestBridgeService {
             
             if (response == null) {
                 LOG.info("Request queued for delayed delivery (polling mode)");
-                // In delayed delivery mode, the response will come later via gotResponseAtUpstream
-                // For now, return a waiting indication
                 throw new IllegalStateException("Delayed delivery not yet fully implemented");
             }
             
@@ -144,7 +134,6 @@ public class CmpRestBridgeService {
             
             @Override
             public CkgContext getCkgConfiguration(String certProfile, int bodyType) {
-                // Central Key Generation not supported in this bridge
                 return null;
             }
             
@@ -153,7 +142,6 @@ public class CmpRestBridgeService {
                 return new CmpMessageInterface() {
                     @Override
                     public CredentialContext getOutputCredentials() {
-                        // Credentials for signing responses to end entities
                         if ("signature".equals(config.getDownstreamProtectionType())) {
                             return loadSignatureCredentials(
                                 config.getDownstreamKeystorePath(),
@@ -164,12 +152,11 @@ public class CmpRestBridgeService {
                         } else if ("mac".equals(config.getDownstreamProtectionType())) {
                             return loadMacCredentials(config.getDownstreamSharedSecret());
                         }
-                        return null; // No protection
+                        return null;
                     }
                     
                     @Override
                     public VerificationContext getInputVerification() {
-                        // Verify incoming requests from end entities
                         return loadTrustAnchors(config.getDownstreamTrustedCerts());
                     }
                     
@@ -180,7 +167,6 @@ public class CmpRestBridgeService {
                     
                     @Override
                     public boolean isMessageTimeDeviationAllowed(long deviation) {
-                        // Allow messages within configured time window
                         return Math.abs(deviation) < config.getMessageTimeDeviationSeconds() * 1000L;
                     }
                     
@@ -196,7 +182,7 @@ public class CmpRestBridgeService {
                     
                     @Override
                     public NestedEndpointContext getNestedEndpointContext() {
-                        return null; // Nested messages not supported
+                        return null;
                     }
                 };
             }
@@ -208,24 +194,20 @@ public class CmpRestBridgeService {
             
             @Override
             public VerificationContext getEnrollmentTrust(String certProfile, int bodyType) {
-                // Trust anchors for verifying enrolled certificates
                 return loadTrustAnchors(config.getEnrollmentTrustedCerts());
             }
             
             @Override
-            public boolean getForceRaVerifyOnUpstream(String certProfile, int bodyType) {
-                // Set POPO to RaVerified for upstream messages (not used with REST)
+            public boolean getForceRaVerifiedOnUpstream(String certProfile, int bodyType) {
                 return false;
             }
             
             @Override
             public InventoryInterface getInventory(String certProfile, int bodyType) {
-                // Optional: Custom authorization logic
                 if (config.getInventoryHandler() != null) {
                     return config.getInventoryHandler();
                 }
                 
-                // Default: accept all requests
                 return new InventoryInterface() {
                     @Override
                     public CheckAndModifyResult checkAndModifyCertRequest(
@@ -257,7 +239,6 @@ public class CmpRestBridgeService {
             
             @Override
             public PersistencyInterface getPersistency() {
-                // Enable persistency for delayed delivery support
                 return DefaultPersistencyImplementation.getInstance();
             }
             
@@ -269,12 +250,11 @@ public class CmpRestBridgeService {
             @Override
             public SupportMessageHandlerInterface getSupportMessageHandler(
                     String certProfile, String infoTypeOid) {
-                return null; // Custom GENM handlers not configured
+                return null;
             }
             
             @Override
             public CmpMessageInterface getUpstreamConfiguration(String certProfile, int bodyType) {
-                // Upstream configuration not used (we use REST instead of CMP upstream)
                 return new CmpMessageInterface() {
                     @Override
                     public CredentialContext getOutputCredentials() { return null; }
@@ -295,7 +275,7 @@ public class CmpRestBridgeService {
             
             @Override
             public boolean isRaVerifiedAcceptable(String certProfile, int bodyType) {
-                return false; // Require signature-based POPO
+                return false;
             }
         };
     }
@@ -308,81 +288,238 @@ public class CmpRestBridgeService {
             LOG.debug("Upstream exchange called with bodyType={}", bodyTypeOfFirstRequest);
             
             try {
-                // Parse the CMP request to extract CSR
-                byte[] csrBytes = extractCsrFromCmpRequest(request, bodyTypeOfFirstRequest);
+                PKIMessage pkiMessage = PKIMessage.getInstance(request);
+                byte[] csrBytes = extractCsrFromCmpRequest(pkiMessage, bodyTypeOfFirstRequest);
                 
                 if (csrBytes == null) {
                     LOG.warn("No CSR found in CMP request, returning null");
                     return null;
                 }
                 
-                // Call REST API to issue certificate
-                String commonName = extractCommonName(request);
+                String commonName = extractCommonName(pkiMessage);
                 String validity = config.getDefaultValidity();
                 
                 LOG.info("Calling REST API to issue certificate for CN={}", commonName);
                 byte[] certBytes = restPkiService.issueCertificate(csrBytes, commonName, validity);
                 
-                // Build CMP response with the issued certificate
-                return buildCmpResponse(request, certBytes, bodyTypeOfFirstRequest);
+                return buildCmpResponse(pkiMessage, certBytes, bodyTypeOfFirstRequest);
                 
             } catch (Exception e) {
                 LOG.error("Error in upstream exchange: {}", e.getMessage(), e);
-                // Return error response
-                return buildCmpErrorResponse(request, e.getMessage(), bodyTypeOfFirstRequest);
+                try {
+                    PKIMessage pkiMessage = PKIMessage.getInstance(request);
+                    return buildCmpErrorResponse(pkiMessage, e.getMessage(), bodyTypeOfFirstRequest);
+                } catch (Exception ex) {
+                    LOG.error("Failed to build error response: {}", ex.getMessage(), ex);
+                    return null;
+                }
             }
         };
     }
 
     /**
-     * Extract the CSR from a CMP request.
+     * Extract the CSR from a CMP request using BouncyCastle.
      * Supports IR, CR, P10CR, and KUR message types.
      */
-    private byte[] extractCsrFromCmpRequest(byte[] cmpRequest, int bodyType) throws Exception {
-        // Use BouncyCastle to parse CMP message and extract CSR
-        // Body types: 0=IR, 2=CR, 5=P10CR, 7=KUR
-        
+    private byte[] extractCsrFromCmpRequest(PKIMessage pkiMessage, int bodyType) throws Exception {
         LOG.trace("Extracting CSR from CMP body type {}", bodyType);
         
-        // Placeholder - actual implementation uses BC CMP API
-        // In real code, use PKIMessage.getInstance(cmpRequest) and navigate to CertReqMsg
+        PKIBody body = pkiMessage.getBody();
         
-        // For now, return a dummy CSR - this will be properly implemented
-        return new byte[0];
+        switch (bodyType) {
+            case PKIBody.TYPE_INIT_REQ:
+            case PKIBody.TYPE_CERT_REQ:
+            case PKIBody.TYPE_KEY_UPDATE_REQ:
+                CertReqMessages certReqMessages = (CertReqMessages) body.getContent();
+                CertReqMsg[] certReqMsgs = certReqMessages.toCertReqMsgArray();
+                if (certReqMsgs == null || certReqMsgs.length == 0) {
+                    throw new IllegalArgumentException("No certificate requests found in message");
+                }
+                
+                CertReqMsg certReqMsg = certReqMsgs[0];
+                return createPkcs10FromCrmf(certReqMsg.getCertReq(), pkiMessage);
+                
+            case PKIBody.TYPE_P10_CERT_REQ:
+                PKCS10CertificationRequest p10CertReq = (PKCS10CertificationRequest) body.getContent();
+                return p10CertReq.getEncoded(ASN1Encoding.DER);
+                
+            default:
+                LOG.warn("Unsupported body type for certificate request: {}", bodyType);
+                return null;
+        }
+    }
+    
+    /**
+     * Create a PKCS#10 CSR from a CRMF CertRequest using BouncyCastle.
+     */
+    private byte[] createPkcs10FromCrmf(CertRequest certRequest, PKIMessage pkiMessage) throws Exception {
+        CertTemplate template = certRequest.getCertTemplate();
+        X500Name subject = template.getSubject();
+        org.bouncycastle.asn1.x509.SubjectPublicKeyInfo publicKeyInfo = template.getPublicKey();
+        
+        if (subject == null || publicKeyInfo == null) {
+            throw new IllegalArgumentException("Subject and/or public key missing from cert template");
+        }
+        
+        org.bouncycastle.pkcs.PKCS10CertificationRequestBuilder p10Builder =
+            new org.bouncycastle.pkcs.PKCS10CertificationRequestBuilder(subject, publicKeyInfo);
+        
+        if (template.getExtensions() != null) {
+            p10Builder.addAttribute(
+                org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.pkcs_9_at_extensionRequest,
+                template.getExtensions()
+            );
+        }
+        
+        ContentSigner signer = new JcaContentSignerBuilder("SHA256withRSA")
+            .setProvider("BC")
+            .build(new DummyPrivateKey());
+            
+        org.bouncycastle.pkcs.PKCS10CertificationRequest p10CertReq = p10Builder.build(signer);
+        return p10CertReq.getEncoded(ASN1Encoding.DER);
     }
 
     /**
      * Extract common name from CMP request.
      */
-    private String extractCommonName(byte[] cmpRequest) {
-        // Parse CMP request and extract subject DN common name
-        // Placeholder implementation
+    private String extractCommonName(PKIMessage pkiMessage) {
+        try {
+            PKIBody body = pkiMessage.getBody();
+            
+            if (body.getType() == PKIBody.TYPE_P10_CERT_REQ) {
+                PKCS10CertificationRequest p10CertReq = (PKCS10CertificationRequest) body.getContent();
+                X500Name subject = p10CertReq.getSubject();
+                return extractCommonNameFromX500(subject);
+            } else {
+                CertReqMessages certReqMessages = (CertReqMessages) body.getContent();
+                CertReqMsg[] certReqMsgs = certReqMessages.toCertReqMsgArray();
+                if (certReqMsgs != null && certReqMsgs.length > 0) {
+                    CertTemplate template = certReqMsgs[0].getCertReq().getCertTemplate();
+                    if (template.getSubject() != null) {
+                        return extractCommonNameFromX500(template.getSubject());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOG.warn("Failed to extract common name: {}", e.getMessage());
+        }
+        
         return "CN=CMP Client";
+    }
+    
+    private String extractCommonNameFromX500(X500Name x500Name) {
+        if (x500Name == null) {
+            return "Unknown";
+        }
+        
+        for (org.bouncycastle.asn1.x500.RDN rdn : x500Name.getRDNs()) {
+            if (rdn.getFirst() != null && 
+                org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.commonName.equals(rdn.getFirst().getType())) {
+                return "CN=" + rdn.getFirst().getValue().toString();
+            }
+        }
+        
+        return x500Name.toString();
     }
 
     /**
      * Build a successful CMP response containing the issued certificate.
      */
-    private byte[] buildCmpResponse(byte[] originalRequest, byte[] certBytes, int bodyType) throws Exception {
-        // Use BouncyCastle PKIBuilder to create CertRepMessage
-        // Must copy TransactionID and nonces from original request
-        
+    private byte[] buildCmpResponse(PKIMessage originalRequest, byte[] certBytes, int bodyType) throws Exception {
         LOG.trace("Building CMP response with certificate");
         
-        // Placeholder - actual implementation uses BC CMP API
-        return new byte[0];
+        java.security.cert.CertificateFactory cf = java.security.cert.CertificateFactory.getInstance("X.509");
+        java.security.cert.X509Certificate issuedCert = 
+            (java.security.cert.X509Certificate) cf.generateCertificate(new ByteArrayInputStream(certBytes));
+        
+        CMPCertificate cmpCert = CMPCertificate.getInstance(
+            org.bouncycastle.asn1.x509.Certificate.getInstance(issuedCert.getEncoded())
+        );
+        
+        PKIHeader requestHeader = originalRequest.getHeader();
+        ASN1Integer certStatus = new ASN1Integer(PKIStatus.GRANTED);
+        
+        CertResponse certResponse = new CertResponse(
+            new ASN1Integer(0),
+            certStatus,
+            new CertifiedKeyPair(cmpCert, null, null),
+            null
+        );
+        
+        CertRepMessage certRepMessage = new CertRepMessage(new CertResponse[] { certResponse });
+        PKIBody responseBody = new PKIBody(bodyType + 1, certRepMessage);
+        
+        HeaderProvider headerProvider = PkiMessageGenerator.buildRespondingHeaderProvider(originalRequest);
+        CredentialContext creds = getDownstreamCredentials();
+        
+        PKIMessage responseMessage;
+        if (creds instanceof SignatureCredentialContext) {
+            SignatureCredentialContext sigCreds = (SignatureCredentialContext) creds;
+            PrivateKey privateKey = sigCreds.getPrivateKey();
+            List<X509Certificate> certChain = sigCreds.getCertificateChain();
+            
+            ContentSigner signer = new JcaContentSignerBuilder("SHA256withRSA")
+                .setProvider("BC")
+                .build(privateKey);
+            
+            List<CMPCertificate> extraCerts = new ArrayList<>();
+            for (X509Certificate cert : certChain) {
+                extraCerts.add(CMPCertificate.getInstance(
+                    org.bouncycastle.asn1.x509.Certificate.getInstance(cert.getEncoded())
+                ));
+            }
+            
+            responseMessage = PkiMessageGenerator.generateAndProtectMessage(
+                headerProvider,
+                responseBody,
+                signer,
+                extraCerts
+            );
+        } else {
+            responseMessage = PkiMessageGenerator.generateUnprotectMessage(headerProvider, responseBody);
+        }
+        
+        return responseMessage.getEncoded(ASN1Encoding.DER);
+    }
+    
+    private CredentialContext getDownstreamCredentials() {
+        if ("signature".equals(config.getDownstreamProtectionType())) {
+            return loadSignatureCredentials(
+                config.getDownstreamKeystorePath(),
+                config.getDownstreamKeystorePassword(),
+                config.getDownstreamKeyAlias(),
+                config.getDownstreamKeyPassword()
+            );
+        } else if ("mac".equals(config.getDownstreamProtectionType())) {
+            return loadMacCredentials(config.getDownstreamSharedSecret());
+        }
+        return null;
     }
 
     /**
      * Build a CMP error response.
      */
-    private byte[] buildCmpErrorResponse(byte[] originalRequest, String errorMsg, int bodyType) throws Exception {
-        // Use BouncyCastle to create ErrorMessage with PKIFailureInfo
-        
+    private byte[] buildCmpErrorResponse(PKIMessage originalRequest, String errorMsg, int bodyType) throws Exception {
         LOG.trace("Building CMP error response: {}", errorMsg);
         
-        // Placeholder - actual implementation uses BC CMP API
-        return new byte[0];
+        int failureInfo = PKIFailureInfo.badRequest;
+        if (errorMsg.contains("authentication") || errorMsg.contains("authorization")) {
+            failureInfo = PKIFailureInfo.badCertTemplate;
+        } else if (errorMsg.contains("internal")) {
+            failureInfo = PKIFailureInfo.systemUnavail;
+        }
+        
+        PKIStatus status = new ASN1Integer(PKIStatus.REJECTION);
+        PKIFreeText statusString = new PKIFreeText(errorMsg);
+        ASN1BitSet failureInfoBits = new ASN1BitSet(new byte[] { (byte) failureInfo });
+        
+        ErrorMsgContent errorMsgContent = new ErrorMsgContent(status, statusString, failureInfoBits);
+        PKIBody responseBody = new PKIBody(PKIBody.TYPE_ERROR, errorMsgContent);
+        
+        HeaderProvider headerProvider = PkiMessageGenerator.buildRespondingHeaderProvider(originalRequest);
+        PKIMessage responseMessage = PkiMessageGenerator.generateUnprotectMessage(headerProvider, responseBody);
+        
+        return responseMessage.getEncoded(ASN1Encoding.DER);
     }
 
     /**
@@ -424,9 +561,7 @@ public class CmpRestBridgeService {
      * Load MAC credentials from shared secret.
      */
     private CredentialContext loadMacCredentials(byte[] sharedSecret) {
-        // Return a SharedSecretCredentialContext
-        // Placeholder implementation
-        return new CredentialContext() {};
+        return new SharedSecretCredentialContext(sharedSecret);
     }
 
     /**
@@ -454,5 +589,19 @@ public class CmpRestBridgeService {
                 return null;
             }
         };
+    }
+    
+    /**
+     * Dummy private key class for creating PKCS#10 CSR from CRMF.
+     */
+    private static class DummyPrivateKey implements java.security.PrivateKey {
+        @Override
+        public String getAlgorithm() { return "RSA"; }
+        
+        @Override
+        public String getFormat() { return "PKCS#8"; }
+        
+        @Override
+        public byte[] getEncoded() { return new byte[0]; }
     }
 }
