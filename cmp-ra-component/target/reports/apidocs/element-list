@@ -1,0 +1,11 @@
+com.siemens.pki.cmpclientcomponent.configuration
+com.siemens.pki.cmpclientcomponent.main
+com.siemens.pki.cmpracomponent.configuration
+com.siemens.pki.cmpracomponent.cryptoservices
+com.siemens.pki.cmpracomponent.main
+com.siemens.pki.cmpracomponent.msggeneration
+com.siemens.pki.cmpracomponent.msgprocessing
+com.siemens.pki.cmpracomponent.msgvalidation
+com.siemens.pki.cmpracomponent.persistency
+com.siemens.pki.cmpracomponent.protection
+com.siemens.pki.cmpracomponent.util
