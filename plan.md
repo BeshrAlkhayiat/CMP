@@ -164,26 +164,11 @@ logging.level=INFO                    # FINEST, FINER, FINE, INFO, WARNING, SEVE
 ## Build System
 
 ### Gradle Configuration
-- Java 11+ (matching cmp-ra-component requirements)
+- Java 17 (matching cmp-ra-component requirements)
 - Dependencies:
-  - `siemens:cmp-ra-component` (from local source)
-  - `org.bouncycastle:bcprov-jdk18on` (via cmp-ra-component)
-  - `org.bouncycastle:bcpkix-jdk18on` (via cmp-ra-component)
-
-### Build Commands
-```bash
-# Compile
-./gradlew build
-
-# Create JAR
-./gradlew jar
-
-# Run application
-java -jar build/libs/lcmp-gateway.jar
-
-# Run tests
-./gradlew test
-```
+  - `siemens:cmp-ra-component`
+  - `org.bouncycastle:bcprov-jdk18on`
+  - `org.bouncycastle:bcpkix-jdk18on`
 
 ## Key Implementation Details
 
@@ -331,40 +316,3 @@ EEs configure CMP client to point to:
 - RFC 9481: Certificate Management Protocol (CMP) Algorithms
 - siemens/cmp-ra-component README and Javadoc
 - CEMA RA OpenAPI Specification (openapi.json)
-
-## Questions for User
-
-Before implementation begins, please confirm/provide:
-
-1. **Test CA Configuration**: You mentioned providing test CA details later. Should I proceed with placeholder values (`test-ca`, `default-template`, `default-lookup`) in the stub configuration?
-
-2. **MAC Secret Format**: For `cmp.mac.secret` in properties file, should it be:
-   - Plain text string (e.g., `my-secret-key`)
-   - Base64-encoded bytes (recommended for binary secrets)
-   - Hex-encoded
-   
-3. **Client Certificate Details**: For testing, should I:
-   - Generate a self-signed test certificate and include it in the repo
-   - Provide instructions for you to create one
-   - Use environment variables for paths
-
-4. **Logging Level Default**: What should be the default logging level?
-   - INFO (production-ready)
-   - FINE (development/debugging)
-   
-5. **HTTP Path for CMP Endpoint**: Should the CMP server listen on:
-   - `/` (root path)
-   - `/cmp` (explicit path)
-   - Configurable path
-
-6. **Transaction Timeout**: What's a reasonable default for `cmp.transaction.timeout`?
-   - 300 seconds (5 minutes) - recommended
-   - 600 seconds (10 minutes)
-   - Other value
-
-7. **Polling RetryAfter**: What should be the default retry time for async operations?
-   - 30 seconds - recommended
-   - 60 seconds
-   - Other value
-
-Once you confirm these details, I'll proceed with the full implementation.
