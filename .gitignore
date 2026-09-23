@@ -1,1 +1,5 @@
-(empty)
+# Compiled and build artifacts
+*.jar
+
+# Dependency directories
+lib/
