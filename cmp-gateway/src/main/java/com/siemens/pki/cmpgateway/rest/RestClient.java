@@ -218,13 +218,20 @@ public class RestClient {
         loginRequest.put("token", identifyNode.path("challenge").path("token").asText(""));
         loginRequest.put("value", credentialValue);
 
-        HttpRequest loginReq = HttpRequest.newBuilder()
+        HttpRequest.Builder loginBuilder = HttpRequest.newBuilder()
                 .uri(URI.create(loginUrl))
                 .POST(HttpRequest.BodyPublishers.ofString(loginRequest.toString()))
-                .header("Content-Type", "application/json")
-                .header("X-CSRF-Token", extractCsrfToken(identifyResp))
-                .header("Cookie", buildCookieHeader())
-                .build();
+                .header("Content-Type", "application/json");
+        // The CSRF token and Cookie header may legitimately be absent (e.g. the very first
+        // login has no session cookies yet, and some CEMA configurations do not send
+        // X-CSRF-Token on every auth response). HttpRequest.Builder.header() rejects null
+        // values with a NullPointerException, so only add headers that actually have a value.
+        String csrf = extractCsrfToken(identifyResp);
+        if (csrf != null && !csrf.isBlank()) {
+            loginBuilder.header("X-CSRF-Token", csrf);
+        }
+        addCookieHeader(loginBuilder);
+        HttpRequest loginReq = loginBuilder.build();
 
         HttpResponse<String> loginResp = httpClient.send(loginReq, HttpResponse.BodyHandlers.ofString());
         for (String setCookie : loginResp.headers().allValues("Set-Cookie")) {
@@ -317,6 +324,36 @@ public class RestClient {
         return sb.length() > 0 ? sb.toString() : null;
     }
 
+    /**
+     * Add the Cookie header to a request builder, but only if there are any cookies to send.
+     * HttpRequest.Builder.header() throws a NullPointerException on null values, and the very
+     * first requests (e.g. /auth/login before any session cookie exists) legitimately have none.
+     */
+    private HttpRequest.Builder addCookieHeader(final HttpRequest.Builder builder) {
+        String cookieHeader = buildCookieHeader();
+        if (cookieHeader != null && !cookieHeader.isBlank()) {
+            builder.header("Cookie", cookieHeader);
+        }
+        return builder;
+    }
+
+    /**
+     * Add the authentication headers (X-CSRF-Token, X-AuthToken, Cookie) that are present after
+     * a successful login. Headers without a value are omitted instead of being passed as null,
+     * which would make HttpRequest.Builder.header() throw a NullPointerException.
+     */
+    private HttpRequest.Builder addAuthHeaders(final HttpRequest.Builder builder) {
+        String csrf = this.csrfToken;
+        if (csrf != null && !csrf.isBlank()) {
+            builder.header("X-CSRF-Token", csrf);
+        }
+        String token = this.authToken;
+        if (token != null && !token.isBlank()) {
+            builder.header("X-AuthToken", token);
+        }
+        return addCookieHeader(builder);
+    }
+
     private static String abbreviate(String s) {
         if (s == null) {
             return "null";
@@ -367,14 +404,11 @@ public class RestClient {
         request.put("returnRoot", false);
         request.put("format", "DER");
         
-        HttpRequest req = HttpRequest.newBuilder()
+        HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
                 .uri(URI.create(issueUrl))
                 .POST(HttpRequest.BodyPublishers.ofString(request.toString()))
-                .header("Content-Type", "application/json")
-                .header("X-CSRF-Token", csrfToken)
-                .header("X-AuthToken", authToken)
-                .header("Cookie", buildCookieHeader())
-                .build();
+                .header("Content-Type", "application/json");
+        HttpRequest req = addAuthHeaders(reqBuilder).build();
         
         HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
         
@@ -419,14 +453,11 @@ public class RestClient {
             request.put("returnRoot", false);
             request.put("format", "DER");
 
-            HttpRequest httpRequest = HttpRequest.newBuilder()
+            HttpRequest.Builder httpRequestBuilder = HttpRequest.newBuilder()
                     .uri(URI.create(generateUrl))
                     .POST(HttpRequest.BodyPublishers.ofString(request.toString()))
-                    .header("Content-Type", "application/json")
-                    .header("X-CSRF-Token", csrfToken)
-                    .header("X-AuthToken", authToken)
-                    .header("Cookie", buildCookieHeader())
-                    .build();
+                    .header("Content-Type", "application/json");
+            HttpRequest httpRequest = addAuthHeaders(httpRequestBuilder).build();
             HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() == 201) {
                 return parseCertificateResult(MAPPER.readTree(response.body()));
@@ -457,14 +488,11 @@ public class RestClient {
         request.put("returnRoot", false);
         request.put("format", "DER");
         
-        HttpRequest req = HttpRequest.newBuilder()
+        HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
                 .uri(URI.create(issueUrl))
                 .POST(HttpRequest.BodyPublishers.ofString(request.toString()))
-                .header("Content-Type", "application/json")
-                .header("X-CSRF-Token", csrfToken)
-                .header("X-AuthToken", authToken)
-                .header("Cookie", buildCookieHeader())
-                .build();
+                .header("Content-Type", "application/json");
+        HttpRequest req = addAuthHeaders(reqBuilder).build();
         
         HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
         
@@ -495,14 +523,11 @@ public class RestClient {
         request.put("serial", serial);
         request.put("reason", reason);
         
-        HttpRequest req = HttpRequest.newBuilder()
+        HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
                 .uri(URI.create(revokeUrl))
                 .method("PATCH", HttpRequest.BodyPublishers.ofString(request.toString()))
-                .header("Content-Type", "application/json")
-                .header("X-CSRF-Token", csrfToken)
-                .header("X-AuthToken", authToken)
-                .header("Cookie", buildCookieHeader())
-                .build();
+                .header("Content-Type", "application/json");
+        HttpRequest req = addAuthHeaders(reqBuilder).build();
         
         HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
         
@@ -526,14 +551,11 @@ public class RestClient {
         ObjectNode request = MAPPER.createObjectNode();
         request.put("uuid", uuid);
         
-        HttpRequest req = HttpRequest.newBuilder()
+        HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
                 .uri(URI.create(fetchUrl))
                 .POST(HttpRequest.BodyPublishers.ofString(request.toString()))
-                .header("Content-Type", "application/json")
-                .header("X-CSRF-Token", csrfToken)
-                .header("X-AuthToken", authToken)
-                .header("Cookie", buildCookieHeader())
-                .build();
+                .header("Content-Type", "application/json");
+        HttpRequest req = addAuthHeaders(reqBuilder).build();
         
         HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
         
