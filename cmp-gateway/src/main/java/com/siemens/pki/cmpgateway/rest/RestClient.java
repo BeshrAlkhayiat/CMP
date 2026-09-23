@@ -54,6 +54,8 @@ public class RestClient {
     private final HttpClient httpClient;
     private String authToken;
     private String csrfToken;
+    // Session cookies received from CEMA (e.g. the AuthToken cookie), sent back on every request
+    private final Map<String, String> sessionCookies = new ConcurrentHashMap<>();
     private final Map<String, PendingRequest> pendingRequests = new ConcurrentHashMap<>();
     
     /**
@@ -145,109 +147,208 @@ public class RestClient {
         if (identifyResp.statusCode() != 200) {
             throw new IOException("Identify failed: " + identifyResp.statusCode() + " - " + identifyResp.body());
         }
+        for (String setCookie : identifyResp.headers().allValues("Set-Cookie")) {
+            storeCookies(setCookie);
+        }
         
-        JsonNode identifyNode = MAPPER.readTree(identifyResp.body());
-        String token = identifyNode.path("tok").asText();
-        
-        // Step 2: Login with password challenge
+        // Step 2: Complete the login (POST /auth/login) answering the password challenge
+        completeLogin(identifyResp, password);
+    }
+    
+    /**
+     * Authenticate using client certificate.
+     * Flow: POST /auth/identify -> (if not already authenticated by the cert) POST /auth/login.
+     */
+    private void authenticateCertificate() throws IOException, InterruptedException {
+        LOG.info("Authenticating with client certificate");
+
+        // Step 1: Identify the user (POST /auth/identify). The TLS client certificate presented
+        // during the handshake maps to this user on the server side.
+        String identifyUrl = baseUrl + "/auth/identify";
+        ObjectNode identifyRequest = MAPPER.createObjectNode();
+        identifyRequest.put("user", username != null && !username.isBlank() ? username : "TenantAdmin");
+        identifyRequest.put("domain", "");
+
+        HttpRequest identifyReq = HttpRequest.newBuilder()
+                .uri(URI.create(identifyUrl))
+                .POST(HttpRequest.BodyPublishers.ofString(identifyRequest.toString()))
+                .header("Content-Type", "application/json")
+                .build();
+
+        HttpResponse<String> identifyResp = httpClient.send(identifyReq, HttpResponse.BodyHandlers.ofString());
+
+        // Store any cookies; CEMA sets session cookies already at this stage.
+        for (String setCookie : identifyResp.headers().allValues("Set-Cookie")) {
+            storeCookies(setCookie);
+        }
+
+        // If the client certificate was accepted, /auth/identify may return a completed
+        // AuthResponse directly (AuthToken cookie set) instead of a password challenge.
+        if (identifyResp.statusCode() == 200) {
+            JsonNode identifyNode = readJsonOrEmpty(identifyResp.body());
+            String cookieToken = sessionCookies.get("authtoken");
+            boolean haveSession = cookieToken != null && !cookieToken.isBlank();
+            boolean certAccepted = haveSession
+                    || ("success".equalsIgnoreCase(identifyNode.path("ctx").path("status").asText("")));
+            if (certAccepted) {
+                this.authToken = extractAuthToken(identifyResp, identifyNode);
+                this.csrfToken = extractCsrfToken(identifyResp);
+                LOG.info("Certificate authentication successful via /auth/identify");
+                return;
+            }
+        }
+
+        // Step 2: Complete the login (POST /auth/login) answering the challenge from identify.
+        // With certificate auth there is no password value to supply, so the challenge token is
+        // echoed back with an empty value.
+        LOG.info("Certificate auth requires login step, calling /auth/login");
+        completeLogin(identifyResp, "");
+    }
+
+    /**
+     * Complete a two-step login: POST /auth/login answering the challenge returned by a previous
+     * /auth/identify response. Shared by the basic-auth and certificate-auth flows.
+     */
+    private void completeLogin(final HttpResponse<String> identifyResp, final String credentialValue)
+            throws IOException, InterruptedException {
+        JsonNode identifyNode = readJsonOrEmpty(identifyResp.body());
+
         String loginUrl = baseUrl + "/auth/login";
         ObjectNode loginRequest = MAPPER.createObjectNode();
-        loginRequest.put("token", identifyNode.path("challenge").path("token").asText());
-        loginRequest.put("value", password);
-        
+        loginRequest.put("token", identifyNode.path("challenge").path("token").asText(""));
+        loginRequest.put("value", credentialValue);
+
         HttpRequest loginReq = HttpRequest.newBuilder()
                 .uri(URI.create(loginUrl))
                 .POST(HttpRequest.BodyPublishers.ofString(loginRequest.toString()))
                 .header("Content-Type", "application/json")
                 .header("X-CSRF-Token", extractCsrfToken(identifyResp))
+                .header("Cookie", buildCookieHeader())
                 .build();
-        
-        HttpResponse<String> loginResp = httpClient.send(loginReq, HttpResponse.BodyHandlers.ofString());
-        if (loginResp.statusCode() != 200) {
-            throw new IOException("Login failed: " + loginResp.statusCode() + " - " + loginResp.body());
-        }
-        
-        JsonNode loginNode = MAPPER.readTree(loginResp.body());
-        this.authToken = loginNode.path("tok").asText();
-        this.csrfToken = extractCsrfToken(loginResp);
-        
-        LOG.info("Authentication successful, token expires: {}", loginNode.path("expiry").asText());
-    }
-    
-    /**
-     * Authenticate using client certificate.
-     */
-    private void authenticateCertificate() throws IOException, InterruptedException {
-        LOG.info("Authenticating with client certificate");
-        
-        // For certificate auth, we use SSO endpoint
-        String ssoUrl = baseUrl + "/auth/sso";
-        
-        HttpRequest ssoReq = HttpRequest.newBuilder()
-                .uri(URI.create(ssoUrl))
-                .GET()
-                .build();
-        
-        HttpResponse<String> ssoResp = httpClient.send(ssoReq, HttpResponse.BodyHandlers.ofString());
-        
-        if (ssoResp.statusCode() == 200) {
-            JsonNode ssoNode = MAPPER.readTree(ssoResp.body());
-            this.authToken = extractAuthToken(ssoResp, ssoNode);
-            this.csrfToken = extractCsrfToken(ssoResp);
-            LOG.info("Certificate authentication successful");
-        } else {
-            // Fallback to basic auth if certificate auth fails
-            LOG.warn("Certificate auth failed ({}), falling back to basic auth", ssoResp.statusCode());
-            if (username != null && password != null) {
-                authenticateBasic();
-            } else {
-                throw new IOException("Certificate auth failed and no fallback credentials available");
-            }
 
+        HttpResponse<String> loginResp = httpClient.send(loginReq, HttpResponse.BodyHandlers.ofString());
+        for (String setCookie : loginResp.headers().allValues("Set-Cookie")) {
+            storeCookies(setCookie);
+        }
+
+        JsonNode loginNode = readJsonOrEmpty(loginResp.body());
+        if (loginResp.statusCode() != 200) {
+            throw new IOException("Login failed: HTTP " + loginResp.statusCode()
+                    + " - " + abbreviate(loginResp.body()));
+        }
+
+        // The actual AuthToken is delivered as Set-Cookie ("tok" in the body is a placeholder)
+        this.authToken = extractAuthToken(loginResp, loginNode);
+        this.csrfToken = extractCsrfToken(loginResp);
+
+        LOG.info("Authentication successful, token expires: {}", loginNode.path("expiry").asText("unknown"));
+    }
+
+    /**
+     * Parse a JSON body, returning an empty object node if the body is not valid JSON
+     * (e.g. an HTML error page).
+     */
+    private JsonNode readJsonOrEmpty(final String body) {
+        try {
+            JsonNode node = MAPPER.readTree(body);
+            return node != null ? node : MAPPER.createObjectNode();
+        } catch (Exception e) {
+            return MAPPER.createObjectNode();
         }
     }
 
     private String extractAuthToken(
             final HttpResponse<String> response, final JsonNode responseBody) {
+        // Per the CEMA OpenAPI spec (AuthResponse), the "tok" field in the JSON body is only
+        // a placeholder; the actual authentication token is delivered in the AuthToken cookie.
+        // So the Set-Cookie header takes precedence over the body value.
+        for (String setCookie : response.headers().allValues("Set-Cookie")) {
+            storeCookies(setCookie);
+        }
+        String cookieToken = sessionCookies.get("authtoken");
+        if (cookieToken != null && !cookieToken.isBlank()) {
+            return cookieToken;
+        }
+        // Fall back to the body value if no cookie was supplied
         final String bodyToken = responseBody.path("tok").asText(null);
         if (bodyToken != null && !bodyToken.isBlank()) {
             return bodyToken;
         }
-        for (String setCookie : response.headers().allValues("Set-Cookie")) {
-            List<HttpCookie> cookies = HttpCookie.parse(setCookie);
-            for (HttpCookie cookie : cookies) {
-                if ("AuthToken".equalsIgnoreCase(cookie.getName())
-                        && cookie.getValue() != null
-                        && !cookie.getValue().isBlank()) {
-                    return cookie.getValue();
+        throw new IllegalStateException("CEMA authentication response did not contain an AuthToken"
+                + " (HTTP " + response.statusCode() + ", body: " + abbreviate(response.body()) + ")");
+    }
+
+    /**
+     * Parse a Set-Cookie header value and remember the cookie for subsequent requests.
+     */
+    private void storeCookies(String setCookieHeader) {
+        try {
+            for (HttpCookie cookie : HttpCookie.parse(setCookieHeader)) {
+                if (cookie.hasExpired() || cookie.getMaxAge() == 0) {
+                    sessionCookies.remove(cookie.getName().toLowerCase());
+                } else {
+                    sessionCookies.put(cookie.getName().toLowerCase(), cookie.getValue());
                 }
             }
+        } catch (IllegalArgumentException e) {
+            LOG.debug("Ignoring unparsable Set-Cookie header: {}", setCookieHeader);
         }
-        throw new IllegalStateException("CEMA authentication response did not contain an AuthToken");
+    }
+
+    /**
+     * Build the Cookie header from all cookies received so far, ensuring that the
+     * AuthToken cookie is present even when only a token value is known.
+     */
+    private String buildCookieHeader() {
+        StringBuilder sb = new StringBuilder();
+        String token = authToken;
+        if (token != null && !token.isBlank()) {
+            sb.append("AuthToken=").append(token);
+        }
+        for (Map.Entry<String, String> entry : sessionCookies.entrySet()) {
+            if ("authtoken".equals(entry.getKey())) {
+                continue; // already added above if non-blank
+            }
+            if (sb.length() > 0) {
+                sb.append("; ");
+            }
+            sb.append(entry.getKey()).append('=').append(entry.getValue());
+        }
+        return sb.length() > 0 ? sb.toString() : null;
+    }
+
+    private static String abbreviate(String s) {
+        if (s == null) {
+            return "null";
+        }
+        return s.length() > 200 ? s.substring(0, 200) + "..." : s;
     }
     
     private String extractCsrfToken(HttpResponse<String> response) {
-        // CSRF token is typically in response headers or body
-        // For now, generate a random one if not found
+        // Per the CEMA OpenAPI spec (AuthResponse), the CSRF token for subsequent requests is
+        // returned in the X-CSRF-Token response header.
         String headerCsrf = response.headers().firstValue("X-CSRF-Token").orElse(null);
-        if (headerCsrf != null) {
+        if (headerCsrf != null && !headerCsrf.isBlank()) {
+            this.csrfToken = headerCsrf;
             return headerCsrf;
         }
-        
-        // Try to extract from response body
-        try {
-            JsonNode node = MAPPER.readTree(response.body());
-            JsonNode ctx = node.path("ctx");
-            if (ctx.has("csrf")) {
-                return ctx.path("csrf").asText();
-            }
-        } catch (Exception e) {
-            // Ignore parsing errors
-        }
-        
-        throw new IllegalStateException("CEMA response did not contain a CSRF token");
+
+        // Fall back to any previously received CSRF token: per the spec, "any previously received
+        // token will be acceptable, as long as it was received from the same server and has not
+        // yet expired". If we never received one at all, proceed without it rather than failing
+        // startup (some CEMA configurations do not send X-CSRF-Token on every auth response).
+        return this.csrfToken;
     }
-    
+
+    private String requireCsrfToken(HttpResponse<String> response) {
+        String csrf = extractCsrfToken(response);
+        if (csrf == null || csrf.isBlank()) {
+            throw new IllegalStateException("CEMA response did not contain a CSRF token"
+                    + " (HTTP " + response.statusCode() + ", body: " + abbreviate(response.body()) + ")");
+        }
+        return csrf;
+    }
+
     /**
      * Issue certificate using template-based approach.
      * @param csr Base64-encoded PKCS#10 CSR
@@ -272,7 +373,7 @@ public class RestClient {
                 .header("Content-Type", "application/json")
                 .header("X-CSRF-Token", csrfToken)
                 .header("X-AuthToken", authToken)
-                .header("Cookie", "AuthToken=" + authToken)
+                .header("Cookie", buildCookieHeader())
                 .build();
         
         HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
@@ -324,7 +425,7 @@ public class RestClient {
                     .header("Content-Type", "application/json")
                     .header("X-CSRF-Token", csrfToken)
                     .header("X-AuthToken", authToken)
-                    .header("Cookie", "AuthToken=" + authToken)
+                    .header("Cookie", buildCookieHeader())
                     .build();
             HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() == 201) {
@@ -362,7 +463,7 @@ public class RestClient {
                 .header("Content-Type", "application/json")
                 .header("X-CSRF-Token", csrfToken)
                 .header("X-AuthToken", authToken)
-                .header("Cookie", "AuthToken=" + authToken)
+                .header("Cookie", buildCookieHeader())
                 .build();
         
         HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
@@ -400,7 +501,7 @@ public class RestClient {
                 .header("Content-Type", "application/json")
                 .header("X-CSRF-Token", csrfToken)
                 .header("X-AuthToken", authToken)
-                .header("Cookie", "AuthToken=" + authToken)
+                .header("Cookie", buildCookieHeader())
                 .build();
         
         HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
@@ -431,7 +532,7 @@ public class RestClient {
                 .header("Content-Type", "application/json")
                 .header("X-CSRF-Token", csrfToken)
                 .header("X-AuthToken", authToken)
-                .header("Cookie", "AuthToken=" + authToken)
+                .header("Cookie", buildCookieHeader())
                 .build();
         
         HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
