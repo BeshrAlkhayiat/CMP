@@ -148,6 +148,16 @@ public final class CmpGateway {
                     case PKIBody.TYPE_INIT_REQ:
                     case PKIBody.TYPE_CERT_REQ:
                     case PKIBody.TYPE_KEY_UPDATE_REQ:
+                        if (!config.isCrmfEnabled()) {
+                            // The CEMA REST API supports CSR (PKCS#10) enrollment only.
+                            // Reject CRMF with a readable error instead of failing later
+                            // in the upstream protection/validation chain.
+                            return errorMessage(message, bodyType,
+                                    "CRMF is not supported by this gateway; the CEMA backend"
+                                            + " accepts PKCS#10 (CSR) requests only."
+                                            + " Use a P10CR client transaction (e.g."
+                                            + " EnrollmentType: P10CR in the LCMP client config).");
+                        }
                         return processCrmf(message, certProfile, persistencyContext);
                     default:
                         throw new UnsupportedOperationException(
@@ -156,6 +166,53 @@ public final class CmpGateway {
             } finally {
                 currentTransaction.remove();
             }
+        }
+
+        /**
+         * Build a CMP error response (PKIResponse with status rejection) for the
+         * given request. Used to reject message types the CEMA backend cannot
+         * handle (e.g. CRMF when only CSR issuance is available) with a readable
+         * statusInfo instead of an opaque transport-level ERROR.
+         */
+        private byte[] errorMessage(
+                final PKIMessage request, final int requestBodyType, final String text)
+                throws Exception {
+            final int responseType;
+            switch (requestBodyType) {
+                case PKIBody.TYPE_INIT_REQ:
+                    responseType = PKIBody.TYPE_INIT_REP;
+                    break;
+                case PKIBody.TYPE_CERT_REQ:
+                    responseType = PKIBody.TYPE_CERT_REP;
+                    break;
+                case PKIBody.TYPE_KEY_UPDATE_REQ:
+                    responseType = PKIBody.TYPE_KEY_UPDATE_REP;
+                    break;
+                default:
+                    responseType = PKIBody.TYPE_ERROR;
+            }
+            LOG.warn("rejecting CMP request: {}", text);
+            final org.bouncycastle.asn1.cmp.PKIFreeText freeText =
+                    new org.bouncycastle.asn1.cmp.PKIFreeText(text);
+            final PKIBody responseBody;
+            if (responseType == PKIBody.TYPE_ERROR) {
+                responseBody = new PKIBody(
+                        responseType,
+                        new org.bouncycastle.asn1.cmp.PKIStatusInfo(
+                                PKIStatus.rejection, freeText, null));
+            } else {
+                final CertResponse rejected = new CertResponse(
+                        new ASN1Integer(BigInteger.ZERO),
+                        new PKIStatusInfo(
+                                PKIStatus.rejection,
+                                freeText,
+                                null));
+                responseBody = new PKIBody(
+                        responseType, new CertRepMessage(null, new CertResponse[] {rejected}));
+            }
+            return PkiMessageGenerator.generateUnprotectMessage(
+                            PkiMessageGenerator.buildRespondingHeaderProvider(request), responseBody)
+                    .getEncoded();
         }
 
         private byte[] processCrmf(

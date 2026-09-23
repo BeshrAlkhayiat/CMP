@@ -99,6 +99,8 @@ public class Main {
             if (centralKeySize != null) {
                 config.setCentralKeySize(Integer.parseInt(centralKeySize));
             }
+            config.setCrmfEnabled(Boolean.parseBoolean(
+                    props.getProperty("crm.enabled", String.valueOf(config.isCrmfEnabled())).trim()));
             
             LOG.info("Configuration loaded from {}", configPath);
             

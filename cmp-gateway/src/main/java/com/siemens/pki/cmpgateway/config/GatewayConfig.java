@@ -54,6 +54,7 @@ public class GatewayConfig implements Configuration {
     private String centralKeyKind;
     private Integer centralKeySize;
     private String centralKeyCurve;
+    private boolean crmfEnabled;
     
     public GatewayConfig() {
         // Defaults
@@ -68,6 +69,9 @@ public class GatewayConfig implements Configuration {
         this.cmpPath = "/cmp";
         this.centralKeyKind = "RSA";
         this.centralKeySize = 2048;
+        // The CEMA REST API currently supports PKCS#10 (CSR) enrollment only,
+        // so CRMF handling is disabled by default.
+        this.crmfEnabled = false;
         this.sharedSecret = "gateway-secret-key".getBytes();
     }
     
@@ -128,6 +132,8 @@ public class GatewayConfig implements Configuration {
     public void setCentralKeySize(Integer centralKeySize) { this.centralKeySize = centralKeySize; }
     public String getCentralKeyCurve() { return centralKeyCurve; }
     public void setCentralKeyCurve(String centralKeyCurve) { this.centralKeyCurve = centralKeyCurve; }
+    public boolean isCrmfEnabled() { return crmfEnabled; }
+    public void setCrmfEnabled(boolean crmfEnabled) { this.crmfEnabled = crmfEnabled; }
     
     /**
      * Load PKCS#12 keystore and extract certificate chain and private key.
