@@ -131,11 +131,11 @@ public class RestClient {
     private void authenticateBasic() throws IOException, InterruptedException {
         LOG.info("Authenticating with basic auth for user: {}", username);
         
-        // Step 1: Identify
+        // Step 1: Identify (POST /auth/identify). Per the OpenAPI spec, a UserLoginRequest
+        // contains only the "user" name.
         String identifyUrl = baseUrl + "/auth/identify";
         ObjectNode identifyRequest = MAPPER.createObjectNode();
         identifyRequest.put("user", username);
-        identifyRequest.put("domain", "");
         
         HttpRequest identifyReq = HttpRequest.newBuilder()
                 .uri(URI.create(identifyUrl))
@@ -157,17 +157,52 @@ public class RestClient {
     
     /**
      * Authenticate using client certificate.
-     * Flow: POST /auth/identify -> (if not already authenticated by the cert) POST /auth/login.
+     * Preferred flow: GET /auth/sso - the single-sign-on endpoint performs exactly the
+     * "identify a user by browser specific authentication information (e.g. TLS client
+     * certificate)" that a certificate login needs, and returns a completed AuthResponse
+     * (AuthToken cookie + X-CSRF-Token header) in one step.
+     * Fallback: POST /auth/identify followed by POST /auth/login answering the returned
+     * password challenge with the configured credential.
      */
     private void authenticateCertificate() throws IOException, InterruptedException {
         LOG.info("Authenticating with client certificate");
 
-        // Step 1: Identify the user (POST /auth/identify). The TLS client certificate presented
-        // during the handshake maps to this user on the server side.
+        // Step 1: Try single sign-on (GET /auth/sso). When the TLS client certificate is mapped
+        // to a CEMA user, this completes the login immediately.
+        HttpRequest ssoReq = HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/auth/sso"))
+                .GET()
+                .build();
+
+        HttpResponse<String> ssoResp = httpClient.send(ssoReq, HttpResponse.BodyHandlers.ofString());
+        for (String setCookie : ssoResp.headers().allValues("Set-Cookie")) {
+            storeCookies(setCookie);
+        }
+
+        if (ssoResp.statusCode() == 200) {
+            JsonNode ssoNode = readJsonOrEmpty(ssoResp.body());
+            if (!ssoNode.hasNonNull("challenge")) {
+                // Completed AuthResponse: the AuthToken cookie (and CSRF token) are now set.
+                this.authToken = extractAuthToken(ssoResp, ssoNode);
+                this.csrfToken = extractCsrfToken(ssoResp);
+                LOG.info("Certificate authentication successful via /auth/sso");
+                return;
+            }
+            // SSO returned a pending challenge - answer it below via /auth/login.
+            completeLogin(ssoResp, resolveCertificateCredential());
+            return;
+        }
+
+        // HTTP 403 (or other) means SSO is unavailable/not mapped for this certificate; fall
+        // back to the regular two-step login via /auth/identify.
+        LOG.info("/auth/sso did not complete the login (HTTP {}), falling back to /auth/identify",
+                ssoResp.statusCode());
+
+        // Step 2 (fallback): Identify the user. Per the OpenAPI spec, a UserLoginRequest
+        // contains only the "user" name.
         String identifyUrl = baseUrl + "/auth/identify";
         ObjectNode identifyRequest = MAPPER.createObjectNode();
         identifyRequest.put("user", username != null && !username.isBlank() ? username : "TenantAdmin");
-        identifyRequest.put("domain", "");
 
         HttpRequest identifyReq = HttpRequest.newBuilder()
                 .uri(URI.create(identifyUrl))
@@ -182,14 +217,15 @@ public class RestClient {
             storeCookies(setCookie);
         }
 
-        // If the client certificate was accepted, /auth/identify may return a completed
-        // AuthResponse directly (AuthToken cookie set) instead of a password challenge.
+        // If the client certificate was accepted, /auth/identify returns a completed AuthResponse
+        // directly (an AuthToken cookie is set and no "challenge" object is present) instead of a
+        // pending AuthChallenge.
         if (identifyResp.statusCode() == 200) {
             JsonNode identifyNode = readJsonOrEmpty(identifyResp.body());
             String cookieToken = sessionCookies.get("authtoken");
             boolean haveSession = cookieToken != null && !cookieToken.isBlank();
-            boolean certAccepted = haveSession
-                    || ("success".equalsIgnoreCase(identifyNode.path("ctx").path("status").asText("")));
+            boolean challengePending = identifyNode.hasNonNull("challenge");
+            boolean certAccepted = haveSession || !challengePending;
             if (certAccepted) {
                 this.authToken = extractAuthToken(identifyResp, identifyNode);
                 this.csrfToken = extractCsrfToken(identifyResp);
@@ -198,25 +234,62 @@ public class RestClient {
             }
         }
 
-        // Step 2: Complete the login (POST /auth/login) answering the challenge from identify.
-        // With certificate auth there is no password value to supply, so the challenge token is
-        // echoed back with an empty value.
+        // Step 3: The certificate alone did not complete authentication; CEMA expects us to
+        // answer the AuthChallenge returned above via POST /auth/login. Per the OpenAPI spec,
+        // AuthChallengeResponse.response has minLength 1, so an empty credential is rejected
+        // with HTTP 400 ("*pResponse* is empty (when trimmed)") - the gateway therefore cannot
+        // complete a login whose second factor it cannot answer (e.g. TOTP/PIN).
         LOG.info("Certificate auth requires login step, calling /auth/login");
-        completeLogin(identifyResp, "");
+        completeLogin(identifyResp, resolveCertificateCredential());
+    }
+
+    /**
+     * Credential used to answer a password challenge during certificate-auth fallback.
+     * Falls back to the keystore password, which is commonly also the account password.
+     */
+    private String resolveCertificateCredential() {
+        if (password != null && !password.isBlank()) {
+            return password;
+        }
+        if (keystorePassword != null && !keystorePassword.isBlank()) {
+            return keystorePassword;
+        }
+        throw new IllegalStateException("CEMA requested a password challenge during certificate"
+                + " authentication, but no credential is available: set 'auth.password' in"
+                + " gateway.properties. A challenge whose 'response' field is empty is rejected"
+                + " by CEMA with HTTP 400 \"*pResponse* is empty (when trimmed)\".");
     }
 
     /**
      * Complete a two-step login: POST /auth/login answering the challenge returned by a previous
      * /auth/identify response. Shared by the basic-auth and certificate-auth flows.
+     *
+     * <p>The request body must be a valid AuthChallengeResponse per the CEMA OpenAPI spec, whose
+     * required fields are {@code ctx}, {@code kind}, {@code token} and {@code response}. Sending
+     * anything less (e.g. only "token"/"value") makes CEMA reject the request with
+     * HTTP 400 "invalid JSON body for type AuthChallengeResponseImpl: ... *pKind* is null".
+     * Therefore the full challenge object (kind, params, token) and the session context (ctx)
+     * are echoed back from the /auth/identify response, with "response" carrying the credential.
      */
     private void completeLogin(final HttpResponse<String> identifyResp, final String credentialValue)
             throws IOException, InterruptedException {
         JsonNode identifyNode = readJsonOrEmpty(identifyResp.body());
+        JsonNode challenge = identifyNode.path("challenge");
+        if (!challenge.isObject()) {
+            throw new IOException("Cannot complete login: /auth/identify response (HTTP "
+                    + identifyResp.statusCode() + ") contained no AuthChallenge to answer - "
+                    + abbreviate(identifyResp.body()));
+        }
 
         String loginUrl = baseUrl + "/auth/login";
         ObjectNode loginRequest = MAPPER.createObjectNode();
-        loginRequest.put("token", identifyNode.path("challenge").path("token").asText(""));
-        loginRequest.put("value", credentialValue);
+        loginRequest.set("ctx", identifyNode.path("ctx"));
+        loginRequest.put("kind", challenge.path("kind").asText(""));
+        if (challenge.hasNonNull("params")) {
+            loginRequest.put("params", challenge.path("params").asText());
+        }
+        loginRequest.put("token", challenge.path("token").asText(""));
+        loginRequest.put("response", credentialValue);
 
         HttpRequest.Builder loginBuilder = HttpRequest.newBuilder()
                 .uri(URI.create(loginUrl))
@@ -241,7 +314,13 @@ public class RestClient {
         JsonNode loginNode = readJsonOrEmpty(loginResp.body());
         if (loginResp.statusCode() != 200) {
             throw new IOException("Login failed: HTTP " + loginResp.statusCode()
-                    + " - " + abbreviate(loginResp.body()));
+                    + " - answering " + challenge.path("kind").asText("?") + " challenge with"
+                    + " credential for user '" + identifyNode.path("ctx").path("display").asText("?")
+                    + "' returned: " + abbreviate(loginResp.body())
+                    + " (if this is a wrong-credentials error during certificate auth, set a valid"
+                    + " 'auth.password' in gateway.properties; if the challenge kind is TOTP or PIN,"
+                    + " the gateway cannot answer it automatically - disable 2FA for this account"
+                    + " or use /auth/sso-compatible client-certificate mapping on the CEMA server)");
         }
 
         // The actual AuthToken is delivered as Set-Cookie ("tok" in the body is a placeholder)
@@ -398,7 +477,11 @@ public class RestClient {
         
         ObjectNode request = MAPPER.createObjectNode();
         request.put("csr", csr);
-        request.put("proto", "CMP");
+        // Per the CEMA OpenAPI spec, "proto" must be an EnrollmentProtocol enum value.
+        // CMP is NOT a valid constant (allowed: ACME, AUTO, EST, EXTERNAL, LCEP, REST, SCEP, MAIL, MANUAL, PRINTER),
+        // so sending "CMP" causes HTTP 400 "No enum constant ...EnrollmentProtocol.CMP".
+        // Use "REST" (the schema default) since this gateway talks to CEMA via its REST API.
+        request.put("proto", "REST");
         request.put("returnIssuer", true);
         request.put("returnChain", true);
         request.put("returnRoot", false);
@@ -447,7 +530,8 @@ public class RestClient {
             if (commonName != null && !commonName.isBlank()) {
                 request.put("commonName", commonName);
             }
-            request.put("proto", "CMP");
+            // "proto" must be a valid EnrollmentProtocol enum value; "CMP" is not one (see issueCertificate).
+            request.put("proto", "REST");
             request.put("returnIssuer", true);
             request.put("returnChain", true);
             request.put("returnRoot", false);
@@ -482,7 +566,8 @@ public class RestClient {
         
         ObjectNode request = MAPPER.createObjectNode();
         request.put("csr", csr);
-        request.put("proto", "CMP");
+        // "proto" must be a valid EnrollmentProtocol enum value; "CMP" is not one (see issueCertificate).
+        request.put("proto", "REST");
         request.put("returnIssuer", true);
         request.put("returnChain", true);
         request.put("returnRoot", false);

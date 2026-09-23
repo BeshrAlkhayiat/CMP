@@ -215,9 +215,13 @@ public final class CmpGateway {
         private byte[] issuePkcs10(final PKIMessage request, final String certProfile) throws Exception {
             final CertificationRequest csr =
                     CertificationRequest.getInstance(request.getBody().getContent());
-            final RestClient.CertificateResult result = config.getLookupName() == null
-                    ? restClient.issueCertificate(Base64.getEncoder().encodeToString(csr.getEncoded()))
-                    : restClient.autoIssueCertificate(Base64.getEncoder().encodeToString(csr.getEncoded()));
+            // If no lookup is configured (or it is blank or the unused default), use the direct
+            // template-based endpoint /ca/{caName}/template/{tplName}/issue instead of auto-issue.
+            final String lookup = config.getLookupName();
+            final boolean useLookup = lookup != null && !lookup.isBlank() && !"default".equals(lookup);
+            final RestClient.CertificateResult result = useLookup
+                    ? restClient.autoIssueCertificate(Base64.getEncoder().encodeToString(csr.getEncoded()))
+                    : restClient.issueCertificate(Base64.getEncoder().encodeToString(csr.getEncoded()));
             return certificateResponse(request, BigInteger.ZERO, awaitCertificate(result));
         }
 
