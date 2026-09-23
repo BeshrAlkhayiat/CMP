@@ -1,424 +1,149 @@
-From 596db5d976f68ad1bde69089e04a53e161ab7ccd Mon Sep 17 00:00:00 2001
+From d4df503a8ef3460bfe92865f60d407f7844db751 Mon Sep 17 00:00:00 2001
 From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
-Date: Wed, 23 Sep 2026 15:53:59 +0000
-Subject: [PATCH 1/3] Fix compilation errors: propagate PersistencyContext
- through issuePkcs10, processCrmf, generateCentralKey to certificateResponse
+Date: Wed, 23 Sep 2026 16:18:09 +0000
+Subject: [PATCH] Add crm.enabled switch (default false): reject CRMF with
+ readable CMP error since CEMA supports CSR/PKCS#10 only
 
 ---
- .../pki/cmpgateway/server/CmpGateway.java     | 22 +++++++++++++------
- 1 file changed, 15 insertions(+), 7 deletions(-)
+ cmp-gateway/gateway.properties.example        |  6 ++
+ .../java/com/siemens/pki/cmpgateway/Main.java |  2 +
+ .../pki/cmpgateway/config/GatewayConfig.java  |  6 ++
+ .../pki/cmpgateway/server/CmpGateway.java     | 57 +++++++++++++++++++
+ 4 files changed, 71 insertions(+)
 
-diff --git a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java
-index 914ba53..4e57217 100644
---- a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java
-+++ b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java
-@@ -158,7 +158,9 @@ public final class CmpGateway {
+diff --git a/cmp-gateway/gateway.properties.example b/cmp-gateway/gateway.properties.example
+index f721a03..fad5d84 100644
+--- a/cmp-gateway/gateway.properties.example
++++ b/cmp-gateway/gateway.properties.example
+@@ -41,3 +41,9 @@ central.key.size=2048
+ # Timing Configuration
+ retry.after.seconds=30
+ downstream.timeout.seconds=300
++
++# CRMF (initReq/certReq/keyUpdateReq) handling. The CEMA REST API currently
++# supports CSR (PKCS#10) enrollment only, so this defaults to false: CRMF requests
++# are rejected with a readable CMP error instead of being forwarded to CEMA.
++# Set to true once the backend can process CRMF.
++crm.enabled=false
+diff --git a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/Main.java b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/Main.java
+index aee7daa..d8a4ac0 100644
+--- a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/Main.java
++++ b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/Main.java
+@@ -99,6 +99,8 @@ public class Main {
+             if (centralKeySize != null) {
+                 config.setCentralKeySize(Integer.parseInt(centralKeySize));
              }
-         }
- 
--        private byte[] processCrmf(final PKIMessage request, final String certProfile) throws Exception {
-+        private byte[] processCrmf(
-+                final PKIMessage request, final String certProfile,
-+                final PersistencyContext persistencyContext) throws Exception {
-             CertReqMsg[] requests = CertReqMessages.getInstance(request.getBody().getContent())
-                         .toCertReqMsgArray();
-             if (requests.length != 1) {
-@@ -174,7 +176,7 @@ public final class CmpGateway {
-                     && !isCentralKeyGenerationRequest(template)) {
-                 return issueCrmf(request, certReqMsg, certProfile);
-             }
--            return generateCentralKey(request, certReqMsg);
-+            return generateCentralKey(request, certReqMsg, persistencyContext);
-         }
- 
-         private boolean isCentralKeyGenerationRequest(final CertTemplate template) {
-@@ -200,8 +202,9 @@ public final class CmpGateway {
-                             + "available CEMA REST API");
-         }
- 
--        private byte[] generateCentralKey(final PKIMessage request, final CertReqMsg certReqMsg)
--                throws Exception {
-+        private byte[] generateCentralKey(
-+                final PKIMessage request, final CertReqMsg certReqMsg,
-+                final PersistencyContext persistencyContext) throws Exception {
-             String commonName = null;
-             final String transactionKey =
-                     Base64.getEncoder().encodeToString(request.getHeader().getTransactionID().getOctets());
-@@ -233,7 +236,10 @@ public final class CmpGateway {
-             }
-             generatedKeys.put(transactionKey, parsePrivateKey(result.privateKey));
-             return certificateResponse(
--                    request, certReqMsg.getCertReq().getCertReqId().getValue(), certificate);
-+                    request,
-+                    persistencyContext,
-+                    certReqMsg.getCertReq().getCertReqId().getValue(),
-+                    certificate);
-         }
- 
-         private PrivateKey parsePrivateKey(final byte[] encoded) throws Exception {
-@@ -247,7 +253,9 @@ public final class CmpGateway {
-             }
-             throw new IOException("CEMA returned an unsupported private-key encoding", last);
-         }
--        private byte[] issuePkcs10(final PKIMessage request, final String certProfile) throws Exception {
-+        private byte[] issuePkcs10(
-+                final PKIMessage request, final String certProfile,
-+                final PersistencyContext persistencyContext) throws Exception {
-             final CertificationRequest csr =
-                     CertificationRequest.getInstance(request.getBody().getContent());
-             // If no lookup is configured (or it is blank or the unused default), use the direct
-@@ -257,7 +265,7 @@ public final class CmpGateway {
-             final RestClient.CertificateResult result = useLookup
-                     ? restClient.autoIssueCertificate(Base64.getEncoder().encodeToString(csr.getEncoded()))
-                     : restClient.issueCertificate(Base64.getEncoder().encodeToString(csr.getEncoded()));
--            return certificateResponse(request, BigInteger.ZERO, awaitCertificate(result));
-+            return certificateResponse(request, persistencyContext, BigInteger.ZERO, awaitCertificate(result));
-         }
- 
-         private byte[] awaitCertificate(final RestClient.CertificateResult initial) throws Exception {
--- 
-2.39.5
-
-
-From 37be889b5c48ccf80564a1abb49b04c86ed45bd6 Mon Sep 17 00:00:00 2001
-From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
-Date: Wed, 23 Sep 2026 15:58:48 +0000
-Subject: [PATCH 2/3] Fix CMP gateway upstream response protection
-
-- Add ThreadLocal PersistencyContext tracking in RestUpstream to correlate downstream request credentials with upstream responses
-- Implement protectUpstreamResponse method to re-sign/protect generated PKIMessages using MsgOutputProtector and InputValidator before returning them to the RA component
-- Update processCrmf, generateCentralKey, issuePkcs10, and certificateResponse signatures to accept and propagate PersistencyContext
-- Import StreamType, BaseCmpException, CmpValidationException, and InputValidator to support validation and protection logic
-- Replace PkiMessageGenerator.generateUnprotectMessage calls with protected message generation to prevent "message is incomplete protected" validation errors
----
- cmp-gateway-fix.patch | 210 ++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 210 insertions(+)
- create mode 100644 cmp-gateway-fix.patch
-
-diff --git a/cmp-gateway-fix.patch b/cmp-gateway-fix.patch
-new file mode 100644
-index 0000000..3519e72
---- /dev/null
-+++ b/cmp-gateway-fix.patch
-@@ -0,0 +1,210 @@
-+diff --git a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java
-+index 57a4e45..4e57217 100644
-+--- a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java
-++++ b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java
-+@@ -15,10 +15,13 @@ import com.siemens.pki.cmpracomponent.main.CmpRaComponent.CmpRaInterface;
-+ import com.siemens.pki.cmpracomponent.main.CmpRaComponent.UpstreamExchange;
-+ import com.siemens.pki.cmpracomponent.msggeneration.MsgOutputProtector;
-+ import com.siemens.pki.cmpracomponent.msggeneration.PkiMessageGenerator;
-++import com.siemens.pki.cmpracomponent.msgprocessing.StreamType;
-++import com.siemens.pki.cmpracomponent.msgvalidation.BaseCmpException;
-++import com.siemens.pki.cmpracomponent.msgvalidation.CmpValidationException;
-++import com.siemens.pki.cmpracomponent.msgvalidation.InputValidator;
-+ import com.siemens.pki.cmpracomponent.msgvalidation.MessageContext;
-+ import com.siemens.pki.cmpracomponent.msgvalidation.MessageHeaderValidator;
-+ import com.siemens.pki.cmpracomponent.persistency.PersistencyContext;
-+-import com.siemens.pki.cmpracomponent.msgprocessing.StreamType;
-+ import com.siemens.pki.cmpracomponent.protection.OutputSharedSecretCredentials;
-+ import com.siemens.pki.cmpgateway.config.GatewayConfig;
-+ import com.siemens.pki.cmpgateway.rest.RestClient;
-+@@ -103,6 +106,16 @@ public final class CmpGateway {
-+     }
-+ 
-+     private final class RestUpstream implements UpstreamExchange, CmpRaComponent.GeneratedKeyProvider {
-++
-++        private static final String UPSTREAM_INTERFACE_NAME = "CMP upstream";
-++
-++        /**
-++         * Tracks the transaction state of the request currently being processed
-++         * by {@link #sendReceiveMessage(byte[], String, int)}, which is invoked
-++         * synchronously while the RA component handles the downstream request.
-++         */
-++        private final ThreadLocal<PersistencyContext> currentTransaction = new ThreadLocal<>();
-++
-+         private final Map<String, PrivateKey> generatedKeys = new ConcurrentHashMap<>();
-+         private final Map<String, Boolean> centralKeyRequests = new ConcurrentHashMap<>();
-+ 
-+@@ -120,22 +133,34 @@ public final class CmpGateway {
-+         public byte[] sendReceiveMessage(
-+                 final byte[] request, final String certProfile, final int bodyType) throws Exception {
-+             final PKIMessage message = parseMessage(request);
-+-            switch (bodyType) {
-+-                case PKIBody.TYPE_P10_CERT_REQ:
-+-                    return issuePkcs10(message, certProfile);
-+-                case PKIBody.TYPE_REVOCATION_REQ:
-+-                    return revoke(message);
-+-                case PKIBody.TYPE_INIT_REQ:
-+-                case PKIBody.TYPE_CERT_REQ:
-+-                case PKIBody.TYPE_KEY_UPDATE_REQ:
-+-                    return processCrmf(message, certProfile);
-+-                default:
-+-                    throw new UnsupportedOperationException(
-+-                            "LCMP body type " + bodyType + " is not mapped to CEMA");
-++            // Remember the transaction of the request being processed so that the
-++            // generated upstream responses can be protected with the matching
-++            // credentials (see protectUpstreamResponse).
-++            final PersistencyContext persistencyContext = new PersistencyContext();
-++            persistencyContext.setRequestType(bodyType);
-++            currentTransaction.set(persistencyContext);
-++            try {
-++                switch (bodyType) {
-++                    case PKIBody.TYPE_P10_CERT_REQ:
-++                        return issuePkcs10(message, certProfile, persistencyContext);
-++                    case PKIBody.TYPE_REVOCATION_REQ:
-++                        return revoke(message);
-++                    case PKIBody.TYPE_INIT_REQ:
-++                    case PKIBody.TYPE_CERT_REQ:
-++                    case PKIBody.TYPE_KEY_UPDATE_REQ:
-++                        return processCrmf(message, certProfile, persistencyContext);
-++                    default:
-++                        throw new UnsupportedOperationException(
-++                                "LCMP body type " + bodyType + " is not mapped to CEMA");
-++                }
-++            } finally {
-++                currentTransaction.remove();
-+             }
-+         }
-+ 
-+-        private byte[] processCrmf(final PKIMessage request, final String certProfile) throws Exception {
-++        private byte[] processCrmf(
-++                final PKIMessage request, final String certProfile,
-++                final PersistencyContext persistencyContext) throws Exception {
-+             CertReqMsg[] requests = CertReqMessages.getInstance(request.getBody().getContent())
-+                         .toCertReqMsgArray();
-+             if (requests.length != 1) {
-+@@ -151,7 +176,7 @@ public final class CmpGateway {
-+                     && !isCentralKeyGenerationRequest(template)) {
-+                 return issueCrmf(request, certReqMsg, certProfile);
-+             }
-+-            return generateCentralKey(request, certReqMsg);
-++            return generateCentralKey(request, certReqMsg, persistencyContext);
-+         }
-+ 
-+         private boolean isCentralKeyGenerationRequest(final CertTemplate template) {
-+@@ -177,8 +202,9 @@ public final class CmpGateway {
-+                             + "available CEMA REST API");
-+         }
-+ 
-+-        private byte[] generateCentralKey(final PKIMessage request, final CertReqMsg certReqMsg)
-+-                throws Exception {
-++        private byte[] generateCentralKey(
-++                final PKIMessage request, final CertReqMsg certReqMsg,
-++                final PersistencyContext persistencyContext) throws Exception {
-+             String commonName = null;
-+             final String transactionKey =
-+                     Base64.getEncoder().encodeToString(request.getHeader().getTransactionID().getOctets());
-+@@ -210,7 +236,10 @@ public final class CmpGateway {
-+             }
-+             generatedKeys.put(transactionKey, parsePrivateKey(result.privateKey));
-+             return certificateResponse(
-+-                    request, certReqMsg.getCertReq().getCertReqId().getValue(), certificate);
-++                    request,
-++                    persistencyContext,
-++                    certReqMsg.getCertReq().getCertReqId().getValue(),
-++                    certificate);
-+         }
-+ 
-+         private PrivateKey parsePrivateKey(final byte[] encoded) throws Exception {
-+@@ -224,7 +253,9 @@ public final class CmpGateway {
-+             }
-+             throw new IOException("CEMA returned an unsupported private-key encoding", last);
-+         }
-+-        private byte[] issuePkcs10(final PKIMessage request, final String certProfile) throws Exception {
-++        private byte[] issuePkcs10(
-++                final PKIMessage request, final String certProfile,
-++                final PersistencyContext persistencyContext) throws Exception {
-+             final CertificationRequest csr =
-+                     CertificationRequest.getInstance(request.getBody().getContent());
-+             // If no lookup is configured (or it is blank or the unused default), use the direct
-+@@ -234,7 +265,7 @@ public final class CmpGateway {
-+             final RestClient.CertificateResult result = useLookup
-+                     ? restClient.autoIssueCertificate(Base64.getEncoder().encodeToString(csr.getEncoded()))
-+                     : restClient.issueCertificate(Base64.getEncoder().encodeToString(csr.getEncoded()));
-+-            return certificateResponse(request, BigInteger.ZERO, awaitCertificate(result));
-++            return certificateResponse(request, persistencyContext, BigInteger.ZERO, awaitCertificate(result));
-+         }
-+ 
-+         private byte[] awaitCertificate(final RestClient.CertificateResult initial) throws Exception {
-+@@ -274,7 +305,10 @@ public final class CmpGateway {
-+         }
-+ 
-+         private byte[] certificateResponse(
-+-                final PKIMessage request, final BigInteger certReqId, final byte[] encodedCertificate)
-++                final PKIMessage request,
-++                final PersistencyContext persistencyContext,
-++                final BigInteger certReqId,
-++                final byte[] encodedCertificate)
-+                 throws Exception {
-+             final Certificate certificate = Certificate.getInstance(
-+                     ASN1Primitive.fromByteArray(encodedCertificate));
-+@@ -289,9 +323,57 @@ public final class CmpGateway {
-+                     : request.getBody().getType() + 1;
-+             final PKIBody responseBody = new PKIBody(
-+                     responseType, new CertRepMessage(null, new CertResponse[] {response}));
-+-            return PkiMessageGenerator.generateUnprotectMessage(
-+-                            PkiMessageGenerator.buildRespondingHeaderProvider(request), responseBody)
-+-                    .getEncoded();
-++            return protectUpstreamResponse(request, persistencyContext, responseBody).getEncoded();
-++        }
-++
-++        /**
-++         * Protect an upstream (RA-side) response with the same credentials that
-++         * were used to protect the related downstream request.
-++         *
-++         * <p>The RA component validates every message coming back from the
-++         * upstream exchange through
-++         * {@link com.siemens.pki.cmpracomponent.msgvalidation.ProtectionValidator}
-++         * using {@code Configuration.getUpstreamConfiguration()}. Since CEMA is
-++         * driven over plain REST and returns unprotected CMP structures, the
-++         * gateway must add protection itself before handing the response back to
-++         * the RA component; otherwise validation fails with
-++         * "message is incomplete protected but protection is required".</p>
-++         */
-++        private PKIMessage protectUpstreamResponse(
-++                final PKIMessage request,
-++                final PersistencyContext persistencyContext,
-++                final PKIBody responseBody)
-++                throws Exception {
-++            // Reuse the credentials that protected the incoming downstream request
-++            // (MAC/shared-secret or signature) for the upstream response, exactly as
-++            // the RA component does when relaying messages in both directions.
-++            MessageContext messageContext = null;
-++            try {
-++                messageContext = new InputValidator(
-++                                UPSTREAM_INTERFACE_NAME,
-++                                config::getDownstreamConfiguration,
-++                                (x, y) -> false,
-++                                java.util.Arrays.asList(
-++                                        PKIBody.TYPE_INIT_REQ,
-++                                        PKIBody.TYPE_CERT_REQ,
-++                                        PKIBody.TYPE_KEY_UPDATE_REQ,
-++                                        PKIBody.TYPE_P10_CERT_REQ,
-++                                        PKIBody.TYPE_REVOCATION_REQ,
-++                                        PKIBody.TYPE_POLL_REQ,
-++                                        PKIBody.TYPE_CERT_CONFIRM,
-++                                        PKIBody.TYPE_GEN_MSG),
-++                                persistencyContext)
-++                        .validate(request);
-++            } catch (final BaseCmpException exception) {
-++                LOG.warn("could not reuse downstream request credentials for upstream response "
-++                        + "protection, falling back to configured output credentials: {}",
-++                        exception.getMessage());
-++            }
-++            final MsgOutputProtector protector = new MsgOutputProtector(
-++                    config.getUpstreamConfiguration(persistencyContext.getCertProfile(), responseBody.getType()),
-++                    StreamType.upstream(UPSTREAM_INTERFACE_NAME),
-++                    messageContext);
-++            return protector.generateAndProtectResponseTo(request, responseBody);
-+         }
-+     }
-+ 
--- 
-2.39.5
-
-
-From 1f04cd82dec2a3d51fb6f0ffcade196a3b095bd3 Mon Sep 17 00:00:00 2001
-From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
-Date: Wed, 23 Sep 2026 16:02:03 +0000
-Subject: [PATCH 3/3] Fix trustAnchors error: wire truststore certs into
- upstream verification, return null to skip path validation where no trust
- configured
-
----
- .../pki/cmpgateway/config/GatewayConfig.java  | 61 ++++++++++++++++++-
- 1 file changed, 58 insertions(+), 3 deletions(-)
-
++            config.setCrmfEnabled(Boolean.parseBoolean(
++                    props.getProperty("crm.enabled", String.valueOf(config.isCrmfEnabled())).trim()));
+             
+             LOG.info("Configuration loaded from {}", configPath);
+             
 diff --git a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/config/GatewayConfig.java b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/config/GatewayConfig.java
-index 7310c37..096f8f6 100644
+index 096f8f6..15833b4 100644
 --- a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/config/GatewayConfig.java
 +++ b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/config/GatewayConfig.java
-@@ -155,6 +155,49 @@ public class GatewayConfig implements Configuration {
-         return trustStore;
+@@ -54,6 +54,7 @@ public class GatewayConfig implements Configuration {
+     private String centralKeyKind;
+     private Integer centralKeySize;
+     private String centralKeyCurve;
++    private boolean crmfEnabled;
+     
+     public GatewayConfig() {
+         // Defaults
+@@ -68,6 +69,9 @@ public class GatewayConfig implements Configuration {
+         this.cmpPath = "/cmp";
+         this.centralKeyKind = "RSA";
+         this.centralKeySize = 2048;
++        // The CEMA REST API currently supports PKCS#10 (CSR) enrollment only,
++        // so CRMF handling is disabled by default.
++        this.crmfEnabled = false;
+         this.sharedSecret = "gateway-secret-key".getBytes();
      }
      
-+    /**
-+     * Extract all X.509 certificates from the configured truststore to be used as
-+     * trust anchors when validating signature-based CMP protection (e.g. upstream
-+     * responses signed by the CA). Returns an empty list if no truststore is configured.
-+     */
-+    public List<X509Certificate> getTrustedCertificatesFromTrustStore() {
-+        if (truststorePath == null || truststorePath.isEmpty()) {
-+            return Collections.emptyList();
-+        }
-+        try {
-+            KeyStore ts = loadTrustStore();
-+            if (ts == null) {
-+                return Collections.emptyList();
-+            }
-+            List<X509Certificate> result = new java.util.ArrayList<>();
-+            java.util.Enumeration<String> aliases = ts.aliases();
-+            while (aliases.hasMoreElements()) {
-+                String alias = aliases.nextElement();
-+                if (ts.isCertificateEntry(alias)) {
-+                    java.security.cert.Certificate cert = ts.getCertificate(alias);
-+                    if (cert instanceof X509Certificate) {
-+                        result.add((X509Certificate) cert);
-+                    }
-+                } else if (ts.isKeyEntry(alias)) {
-+                    java.security.cert.Certificate[] chain = ts.getCertificateChain(alias);
-+                    if (chain != null) {
-+                        for (java.security.cert.Certificate cert : chain) {
-+                            if (cert instanceof X509Certificate) {
-+                                result.add((X509Certificate) cert);
-+                            }
+@@ -128,6 +132,8 @@ public class GatewayConfig implements Configuration {
+     public void setCentralKeySize(Integer centralKeySize) { this.centralKeySize = centralKeySize; }
+     public String getCentralKeyCurve() { return centralKeyCurve; }
+     public void setCentralKeyCurve(String centralKeyCurve) { this.centralKeyCurve = centralKeyCurve; }
++    public boolean isCrmfEnabled() { return crmfEnabled; }
++    public void setCrmfEnabled(boolean crmfEnabled) { this.crmfEnabled = crmfEnabled; }
+     
+     /**
+      * Load PKCS#12 keystore and extract certificate chain and private key.
+diff --git a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java
+index 4e57217..18a8a63 100644
+--- a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java
++++ b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java
+@@ -148,6 +148,16 @@ public final class CmpGateway {
+                     case PKIBody.TYPE_INIT_REQ:
+                     case PKIBody.TYPE_CERT_REQ:
+                     case PKIBody.TYPE_KEY_UPDATE_REQ:
++                        if (!config.isCrmfEnabled()) {
++                            // The CEMA REST API supports CSR (PKCS#10) enrollment only.
++                            // Reject CRMF with a readable error instead of failing later
++                            // in the upstream protection/validation chain.
++                            return errorMessage(message, bodyType,
++                                    "CRMF is not supported by this gateway; the CEMA backend"
++                                            + " accepts PKCS#10 (CSR) requests only."
++                                            + " Use a P10CR client transaction (e.g."
++                                            + " EnrollmentType: P10CR in the LCMP client config).");
 +                        }
-+                    }
-+                }
+                         return processCrmf(message, certProfile, persistencyContext);
+                     default:
+                         throw new UnsupportedOperationException(
+@@ -158,6 +168,53 @@ public final class CmpGateway {
+             }
+         }
+ 
++        /**
++         * Build a CMP error response (PKIResponse with status rejection) for the
++         * given request. Used to reject message types the CEMA backend cannot
++         * handle (e.g. CRMF when only CSR issuance is available) with a readable
++         * statusInfo instead of an opaque transport-level ERROR.
++         */
++        private byte[] errorMessage(
++                final PKIMessage request, final int requestBodyType, final String text)
++                throws Exception {
++            final int responseType;
++            switch (requestBodyType) {
++                case PKIBody.TYPE_INIT_REQ:
++                    responseType = PKIBody.TYPE_INIT_REP;
++                    break;
++                case PKIBody.TYPE_CERT_REQ:
++                    responseType = PKIBody.TYPE_CERT_REP;
++                    break;
++                case PKIBody.TYPE_KEY_UPDATE_REQ:
++                    responseType = PKIBody.TYPE_KEY_UPDATE_REP;
++                    break;
++                default:
++                    responseType = PKIBody.TYPE_ERROR;
 +            }
-+            LOG.info("Loaded " + result.size() + " trusted certificate(s) from truststore '"
-+                    + truststorePath + "'");
-+            return result;
-+        } catch (Exception e) {
-+            LOG.warn("could not load truststore '" + truststorePath + "' for CMP protection validation", e);
-+            return Collections.emptyList();
++            LOG.warn("rejecting CMP request: {}", text);
++            final org.bouncycastle.asn1.cmp.PKIFreeText freeText =
++                    new org.bouncycastle.asn1.cmp.PKIFreeText(text);
++            final PKIBody responseBody;
++            if (responseType == PKIBody.TYPE_ERROR) {
++                responseBody = new PKIBody(
++                        responseType,
++                        new org.bouncycastle.asn1.cmp.PKIStatusInfo(
++                                PKIStatus.rejection, freeText, null));
++            } else {
++                final CertResponse rejected = new CertResponse(
++                        new ASN1Integer(BigInteger.ZERO),
++                        new PKIStatusInfo(
++                                PKIStatus.rejection,
++                                freeText,
++                                null));
++                responseBody = new PKIBody(
++                        responseType, new CertRepMessage(null, new CertResponse[] {rejected}));
++            }
++            return PkiMessageGenerator.generateUnprotectMessage(
++                            PkiMessageGenerator.buildRespondingHeaderProvider(request), responseBody)
++                    .getEncoded();
 +        }
-+    }
 +
-     public List<X509Certificate> getCertificateChain() throws Exception {
-         KeyStore ks = loadKeyStore();
-         if (ks == null) {
-@@ -254,7 +297,11 @@ public class GatewayConfig implements Configuration {
-                     
-                     @Override
-                     public Collection<X509Certificate> getTrustedCertificates() {
--                        return Collections.emptyList(); // Accept all for now
-+                        // Trust anchors for signature-protected downstream requests.
-+                        // null disables certificate-path validation (accept any signer);
-+                        // an empty collection would make PKIX path building fail with
-+                        // "the trustAnchors parameter must be non-empty".
-+                        return null;
-                     }
-                 };
-             }
-@@ -308,7 +355,9 @@ public class GatewayConfig implements Configuration {
-         return new VerificationContext() {
-             @Override
-             public Collection<X509Certificate> getTrustedCertificates() {
--                return Collections.emptyList(); // Configure as needed
-+                // No enrollment trust configured: return null to skip certificate-path
-+                // validation instead of an empty list (which breaks PKIX path building).
-+                return null;
-             }
-         };
-     }
-@@ -352,7 +401,13 @@ public class GatewayConfig implements Configuration {
-                 return new VerificationContext() {
-                     @Override
-                     public Collection<X509Certificate> getTrustedCertificates() {
--                        return Collections.emptyList();
-+                        // Trust anchors for validating signature-protected upstream
-+                        // responses: the certificates from the configured truststore.
-+                        // If none are configured, return null to skip path validation
-+                        // rather than an empty list, which fails with
-+                        // "the trustAnchors parameter must be non-empty".
-+                        List<X509Certificate> trusted = getTrustedCertificatesFromTrustStore();
-+                        return trusted.isEmpty() ? null : trusted;
-                     }
-                 };
-             }
+         private byte[] processCrmf(
+                 final PKIMessage request, final String certProfile,
+                 final PersistencyContext persistencyContext) throws Exception {
 -- 
 2.39.5
 
