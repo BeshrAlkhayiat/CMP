@@ -4,10 +4,22 @@
  */
 package com.siemens.pki.cmpgateway.server;
 
+import com.siemens.pki.cmpracomponent.configuration.CmpMessageInterface;
+import com.siemens.pki.cmpracomponent.configuration.Configuration;
+import com.siemens.pki.cmpracomponent.configuration.CredentialContext;
+import com.siemens.pki.cmpracomponent.configuration.SharedSecretCredentialContext;
+import com.siemens.pki.cmpracomponent.configuration.VerificationContext;
+import com.siemens.pki.cmpracomponent.cryptoservices.AlgorithmHelper;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent.CmpRaInterface;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent.UpstreamExchange;
+import com.siemens.pki.cmpracomponent.msggeneration.MsgOutputProtector;
 import com.siemens.pki.cmpracomponent.msggeneration.PkiMessageGenerator;
+import com.siemens.pki.cmpracomponent.msgvalidation.MessageContext;
+import com.siemens.pki.cmpracomponent.msgvalidation.MessageHeaderValidator;
+import com.siemens.pki.cmpracomponent.persistency.PersistencyContext;
+import com.siemens.pki.cmpracomponent.msgprocessing.StreamType;
+import com.siemens.pki.cmpracomponent.protection.OutputSharedSecretCredentials;
 import com.siemens.pki.cmpgateway.config.GatewayConfig;
 import com.siemens.pki.cmpgateway.rest.RestClient;
 import com.sun.net.httpserver.HttpExchange;
