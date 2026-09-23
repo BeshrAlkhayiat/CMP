@@ -15,6 +15,7 @@ import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.cert.X509Certificate;
 import java.util.Collections;
+import java.util.Collection;
 import java.util.List;
 
 /**
@@ -35,8 +36,12 @@ public class GatewayConfig implements Configuration {
     private String keystorePath;
     private String keystorePassword;
     private String keyAlias;
+    private String truststorePath;
+    private String truststorePassword;
+    private String truststoreType;
     private String username;
     private String password;
+    private String loginUser;
     
     // CMP protection configuration
     private byte[] sharedSecret;
@@ -44,6 +49,11 @@ public class GatewayConfig implements Configuration {
     // Timeouts
     private int retryAfterSeconds;
     private int downstreamTimeoutSeconds;
+    private int cmpPort;
+    private String cmpPath;
+    private String centralKeyKind;
+    private Integer centralKeySize;
+    private String centralKeyCurve;
     
     public GatewayConfig() {
         // Defaults
@@ -54,6 +64,10 @@ public class GatewayConfig implements Configuration {
         this.authType = "certificate";
         this.retryAfterSeconds = 30;
         this.downstreamTimeoutSeconds = 300;
+        this.cmpPort = 9000;
+        this.cmpPath = "/cmp";
+        this.centralKeyKind = "RSA";
+        this.centralKeySize = 2048;
         this.sharedSecret = "gateway-secret-key".getBytes();
     }
     
@@ -81,12 +95,20 @@ public class GatewayConfig implements Configuration {
     
     public String getKeyAlias() { return keyAlias; }
     public void setKeyAlias(String keyAlias) { this.keyAlias = keyAlias; }
+    public String getTruststorePath() { return truststorePath; }
+    public void setTruststorePath(String truststorePath) { this.truststorePath = truststorePath; }
+    public String getTruststorePassword() { return truststorePassword; }
+    public void setTruststorePassword(String truststorePassword) { this.truststorePassword = truststorePassword; }
+    public String getTruststoreType() { return truststoreType; }
+    public void setTruststoreType(String truststoreType) { this.truststoreType = truststoreType; }
     
     public String getUsername() { return username; }
     public void setUsername(String username) { this.username = username; }
     
     public String getPassword() { return password; }
     public void setPassword(String password) { this.password = password; }
+    public String getLoginUser() { return loginUser; }
+    public void setLoginUser(String loginUser) { this.loginUser = loginUser; }
     
     public byte[] getSharedSecret() { return sharedSecret; }
     public void setSharedSecret(byte[] sharedSecret) { this.sharedSecret = sharedSecret; }
@@ -96,6 +118,16 @@ public class GatewayConfig implements Configuration {
     
     public int getDownstreamTimeoutSeconds() { return downstreamTimeoutSeconds; }
     public void setDownstreamTimeoutSeconds(int downstreamTimeoutSeconds) { this.downstreamTimeoutSeconds = downstreamTimeoutSeconds; }
+    public int getCmpPort() { return cmpPort; }
+    public void setCmpPort(int cmpPort) { this.cmpPort = cmpPort; }
+    public String getCmpPath() { return cmpPath; }
+    public void setCmpPath(String cmpPath) { this.cmpPath = cmpPath; }
+    public String getCentralKeyKind() { return centralKeyKind; }
+    public void setCentralKeyKind(String centralKeyKind) { this.centralKeyKind = centralKeyKind; }
+    public Integer getCentralKeySize() { return centralKeySize; }
+    public void setCentralKeySize(Integer centralKeySize) { this.centralKeySize = centralKeySize; }
+    public String getCentralKeyCurve() { return centralKeyCurve; }
+    public void setCentralKeyCurve(String centralKeyCurve) { this.centralKeyCurve = centralKeyCurve; }
     
     /**
      * Load PKCS#12 keystore and extract certificate chain and private key.
@@ -109,6 +141,18 @@ public class GatewayConfig implements Configuration {
             ks.load(fis, keystorePassword.toCharArray());
         }
         return ks;
+    }
+
+    public KeyStore loadTrustStore() throws Exception {
+        if (truststorePath == null || truststorePath.isEmpty()) {
+            return null;
+        }
+        KeyStore trustStore = KeyStore.getInstance(
+                truststoreType == null || truststoreType.isEmpty() ? KeyStore.getDefaultType() : truststoreType);
+        try (FileInputStream fis = new FileInputStream(truststorePath)) {
+            trustStore.load(fis, truststorePassword == null ? null : truststorePassword.toCharArray());
+        }
+        return trustStore;
     }
     
     public List<X509Certificate> getCertificateChain() throws Exception {
@@ -141,8 +185,58 @@ public class GatewayConfig implements Configuration {
     
     @Override
     public CkgContext getCkgConfiguration(String certProfile, int bodyType) {
-        // Central key generation not supported in gateway mode
-        return null;
+        return new CkgContext() {
+            @Override
+            public CkgKeyAgreementContext getKeyAgreementContext() {
+                return null;
+            }
+
+            @Override
+            public CkgKeyTransportContext getKeyTransportContext() {
+                return new CkgKeyTransportContext() {};
+            }
+
+            @Override
+            public CkgPasswordContext getPasswordContext() {
+                return new CkgPasswordContext() {
+                    @Override
+                    public SharedSecretCredentialContext getEncryptionCredentials() {
+                        return new SharedSecretCredentialContext() {
+                            @Override
+                            public byte[] getSharedSecret() {
+                                return sharedSecret;
+                            }
+                        };
+                    }
+                };
+            }
+
+            @Override
+            public SignatureCredentialContext getSigningCredentials() {
+                try {
+                    final List<X509Certificate> chain = getCertificateChain();
+                    final PrivateKey key = getPrivateKey();
+                    if (chain.isEmpty() || key == null) {
+                        throw new IllegalStateException(
+                                "central key generation requires gateway signing credentials");
+                    }
+                    return new SignatureCredentialContext() {
+                        @Override
+                        public List<X509Certificate> getCertificateChain() {
+                            return chain;
+                        }
+
+                        @Override
+                        public PrivateKey getPrivateKey() {
+                            return key;
+                        }
+                    };
+                } catch (Exception exception) {
+                    throw new IllegalStateException(
+                            "could not load gateway signing credentials for central key generation", exception);
+                }
+            }
+        };
     }
     
     @Override
@@ -257,12 +351,7 @@ public class GatewayConfig implements Configuration {
                 // Verify responses from CA
                 return new VerificationContext() {
                     @Override
-                    public List<X509Certificate> getTrustAnchors() {
-                        return Collections.emptyList(); // Configure as needed
-                    }
-                    
-                    @Override
-                    public List<X509Certificate> getIntermediateCertificates() {
+                    public Collection<X509Certificate> getTrustedCertificates() {
                         return Collections.emptyList();
                     }
                 };
@@ -301,6 +390,21 @@ public class GatewayConfig implements Configuration {
             @Override
             public ReprotectMode getReprotectMode() {
                 return ReprotectMode.reprotect;
+            }
+
+            @Override
+            public boolean getSuppressRedundantExtraCerts() {
+                return false;
+            }
+
+            @Override
+            public boolean isCacheExtraCerts() {
+                return true;
+            }
+
+            @Override
+            public boolean isMessageTimeDeviationAllowed(long deviation) {
+                return Math.abs(deviation) < 300;
             }
         };
     }

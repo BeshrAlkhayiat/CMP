@@ -13,6 +13,7 @@ auth.type=certificate
 
 # For basic authentication
 auth.username=admin
+auth.login.user=TenantAdmin
 auth.password=changeit
 
 # For certificate authentication (PKCS#12 format)
@@ -20,8 +21,22 @@ auth.keystore.path=/path/to/client-cert.p12
 auth.keystore.password=changeit
 auth.keystore.alias=client
 
+# CA truststore containing the CEMA HTTPS server certificate or issuing CA
+auth.truststore.path=/path/to/cema-truststore.p12
+auth.truststore.password=truststore-password
+auth.truststore.type=PKCS12
+
 # CMP Protection Secret (text format, used for MAC-based protection)
 cmp.protection.secret=gateway-secret-key
+
+# CMP listener
+cmp.server.port=9000
+cmp.server.path=/cmp
+
+# Central key generation defaults for CRMF requests without a subject public key
+central.key.kind=RSA
+central.key.size=2048
+# central.key.curve=secp256r1
 
 # Timing Configuration
 retry.after.seconds=30

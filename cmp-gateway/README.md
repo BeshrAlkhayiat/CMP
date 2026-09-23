@@ -6,12 +6,15 @@ This implementation leverages the **siemens/cmp-ra-component** library for all C
 
 ## Features
 
-- **RFC 9483 Compliant**: Supports IR, CR, P10CR, KUR, RR, and Poll messages.
+- **RFC 9483 message processing**: `cmp-ra-component` parses and protects the
+  LCMP message types it supports; the CEMA adapter maps the supported enrollment
+  and revocation operations and leaves unavailable mappings explicit.
 - **Dual Protection**: Automatically handles both MAC-based and Signature-based protection via `cmp-ra-component`.
 - **REST Integration**: Translates CMP requests to CEMA RA REST API calls (`/ca/{ca}/template/{tpl}/issue`, etc.).
 - **Flexible Authentication**: Supports Client Certificate (PKCS#12) authentication with HTTP Basic Auth fallback.
 - **CSRF Handling**: Automatically retrieves and manages CSRF tokens from the RA.
-- **Synchronous EE Communication**: End Entities receive immediate responses; asynchronous CA operations are handled internally via polling if needed.
+- **Synchronous EE Communication**: End Entities receive immediate responses; a
+  pending CEMA issuance is polled by the gateway before returning the CMP result.
 - **Configurable**: Easy setup via `gateway.properties`.
 
 ## Prerequisites
@@ -95,6 +98,14 @@ The gateway depends on the local `cmp-ra-component` library. You must build and 
     ra.auth.username=admin
     ra.auth.password=secret
 
+    # Truststore containing the CEMA HTTPS server certificate or issuing CA
+    auth.truststore.path=C:/path/to/cema-truststore.p12
+    auth.truststore.password=truststore-password
+    auth.truststore.type=PKCS12
+
+    # CEMA application login user; may differ from HTTP BasicAuth username
+    auth.login.user=TenantAdmin
+
     # --- CMP Protection (Handled by cmp-ra-component) ---
     # MAC Secret (Text format for testing)
     cmp.protection.mac.secret=TopSecretMacKey
@@ -149,11 +160,14 @@ openssl cmp -srvaddr localhost:9000 -srppath /cmp `
 1.  **Request**: The End Entity sends a CMP `IR` to `http://localhost:9000/cmp`.
 2.  **Processing**:
     *   `cmp-ra-component` validates the MAC/Signature.
-    *   The Gateway extracts the CSR data.
-    *   The Gateway performs a `POST` to `/auth/identify` to get a CSRF token.
-    *   The Gateway performs a `POST` to `/ca/{ca}/template/{tpl}/issue` with the CSR.
+    *   For an IR without a subject public key, the Gateway uses the LCMP
+        central-key-generation branch and performs a `POST` to
+        `/ca/{ca}/template/{tpl}/generate`.
+    *   For CRMF containing a subject public key, the Gateway enters the
+        ordinary CRMF issuance adapter (currently an explicit stub because
+        CEMA has no CRMF/POP REST operation).
 3.  **Response**:
-    *   If the RA issues immediately (200/201), the Gateway returns a CMP `IP` (Initialization Response) with the certificate.
+    *   If the RA issues immediately (201), the Gateway returns a CMP `IP` (Initialization Response) with the certificate and, for central key generation, the encrypted private key.
     *   If the RA delays (202), the Gateway internally polls the RA until the cert is ready, then returns the CMP `IP`.
 
 ## Troubleshooting
@@ -167,7 +181,20 @@ openssl cmp -srvaddr localhost:9000 -srppath /cmp `
 
 -   **Synchronous Design**: The interface between the End Entity and this Gateway is strictly synchronous. The Gateway handles any necessary asynchronous polling with the backend RA transparently.
 -   **Logging**: Uses `java.util.logging`. Logs are printed to the console. Adjust levels in `gateway.properties` if needed (currently set to `INFO`).
--   **Extensibility**: The code is structured to easily add support for more LCMP features (like CRLs, GENM) by extending the `CmpGateway` class logic.
+-   **Current support boundary**:
+    - `p10cr`: implemented through CEMA issue/auto-issue REST endpoints.
+    - `rr`: implemented through CEMA revoke REST endpoint.
+    - `poll`: handled by `cmp-ra-component`; pending REST issuance is completed internally.
+    - `ir`, `cr`, and `kur`: routed as normal CRMF operations. Requests without a
+      subject public key take the LCMP central-key-generation branch through
+      `/ca/{ca}/template/{template}/generate`; the returned PKCS#8 private key is
+      supplied to `cmp-ra-component`, which signs and encrypts it in the CMP
+      response. Requests with a subject public key take the ordinary CRMF
+      issuance branch.
+    - Ordinary CRMF issuance and batched CRMF requests are explicit stubs because
+      the current CEMA REST API has no operation that accepts CRMF/POP data.
+    - `genm`, nested, cross-certification, key recovery, CA-key update, and
+      announcement/CRL operations are not mapped to CEMA.
 
 ## License
 

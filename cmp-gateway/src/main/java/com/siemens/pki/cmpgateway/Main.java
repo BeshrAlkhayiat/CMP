@@ -70,9 +70,14 @@ public class Main {
             config.setAuthType(props.getProperty("auth.type", config.getAuthType()));
             config.setUsername(props.getProperty("auth.username", config.getUsername()));
             config.setPassword(props.getProperty("auth.password", config.getPassword()));
+            config.setLoginUser(props.getProperty("auth.login.user", config.getLoginUser()));
             config.setKeystorePath(props.getProperty("auth.keystore.path", config.getKeystorePath()));
             config.setKeystorePassword(props.getProperty("auth.keystore.password", config.getKeystorePassword()));
             config.setKeyAlias(props.getProperty("auth.keystore.alias", config.getKeyAlias()));
+            config.setTruststorePath(props.getProperty("auth.truststore.path", config.getTruststorePath()));
+            config.setTruststorePassword(
+                    props.getProperty("auth.truststore.password", config.getTruststorePassword()));
+            config.setTruststoreType(props.getProperty("auth.truststore.type", config.getTruststoreType()));
             
             String secret = props.getProperty("cmp.protection.secret", null);
             if (secret != null) {
@@ -83,6 +88,15 @@ public class Main {
                 props.getProperty("retry.after.seconds", String.valueOf(config.getRetryAfterSeconds()))));
             config.setDownstreamTimeoutSeconds(Integer.parseInt(
                 props.getProperty("downstream.timeout.seconds", String.valueOf(config.getDownstreamTimeoutSeconds()))));
+            config.setCmpPort(Integer.parseInt(
+                props.getProperty("cmp.server.port", String.valueOf(config.getCmpPort()))));
+            config.setCmpPath(props.getProperty("cmp.server.path", config.getCmpPath()));
+            config.setCentralKeyKind(props.getProperty("central.key.kind", config.getCentralKeyKind()));
+            config.setCentralKeyCurve(props.getProperty("central.key.curve", config.getCentralKeyCurve()));
+            String centralKeySize = props.getProperty("central.key.size");
+            if (centralKeySize != null) {
+                config.setCentralKeySize(Integer.parseInt(centralKeySize));
+            }
             
             LOG.info("Configuration loaded from {}", configPath);
             

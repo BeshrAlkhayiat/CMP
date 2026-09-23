@@ -1,4 +1,3 @@
-```
 # Dependencies
 target/
 .m2/
@@ -15,10 +14,10 @@ target/
 
 # Editors
 .vscode/
-.idea/
+.idea
+
 
 # Build artifacts
 *.class
 *.jar
 *.war
-```

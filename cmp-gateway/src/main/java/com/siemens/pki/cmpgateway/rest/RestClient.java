@@ -12,6 +12,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.URI;
+import java.net.HttpCookie;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -22,9 +23,11 @@ import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.TrustManagerFactory;
 
 /**
@@ -46,6 +49,7 @@ public class RestClient {
     private final KeyStore keyStore;
     private final String keystorePassword;
     private final String keyAlias;
+    private final KeyStore trustStore;
     
     private final HttpClient httpClient;
     private String authToken;
@@ -69,7 +73,8 @@ public class RestClient {
     
     public RestClient(String baseUrl, String caName, String tplName, String lookupName,
                       String authType, String username, String password,
-                      KeyStore keyStore, String keystorePassword, String keyAlias) throws Exception {
+                      KeyStore keyStore, String keystorePassword, String keyAlias,
+                      KeyStore trustStore) throws Exception {
         this.baseUrl = baseUrl;
         this.caName = caName;
         this.tplName = tplName;
@@ -80,6 +85,7 @@ public class RestClient {
         this.keyStore = keyStore;
         this.keystorePassword = keystorePassword;
         this.keyAlias = keyAlias;
+        this.trustStore = trustStore;
         
         this.httpClient = createHttpClient();
         
@@ -96,17 +102,20 @@ public class RestClient {
                 .version(HttpClient.Version.HTTP_2)
                 .followRedirects(HttpClient.Redirect.NORMAL);
         
-        if (keyStore != null && "certificate".equalsIgnoreCase(authType)) {
-            // Create SSL context with client certificate
-            KeyStore trustStore = KeyStore.getInstance(KeyStore.getDefaultType());
-            trustStore.load(null, null);
-            
+        if ((keyStore != null && "certificate".equalsIgnoreCase(authType)) || trustStore != null) {
+            javax.net.ssl.KeyManager[] keyManagers = null;
+            if (keyStore != null && "certificate".equalsIgnoreCase(authType)) {
+                KeyManagerFactory kmf = KeyManagerFactory.getInstance(
+                        KeyManagerFactory.getDefaultAlgorithm());
+                kmf.init(keyStore, keystorePassword.toCharArray());
+                keyManagers = kmf.getKeyManagers();
+            }
             TrustManagerFactory tmf = TrustManagerFactory.getInstance(
                     TrustManagerFactory.getDefaultAlgorithm());
             tmf.init(trustStore);
             
             SSLContext sslContext = SSLContext.getInstance("TLS");
-            sslContext.init(null, tmf.getTrustManagers(), new SecureRandom());
+            sslContext.init(keyManagers, tmf.getTrustManagers(), new SecureRandom());
             
             builder.sslContext(sslContext);
         }
@@ -183,7 +192,7 @@ public class RestClient {
         
         if (ssoResp.statusCode() == 200) {
             JsonNode ssoNode = MAPPER.readTree(ssoResp.body());
-            this.authToken = ssoNode.path("tok").asText();
+            this.authToken = extractAuthToken(ssoResp, ssoNode);
             this.csrfToken = extractCsrfToken(ssoResp);
             LOG.info("Certificate authentication successful");
         } else {
@@ -194,7 +203,27 @@ public class RestClient {
             } else {
                 throw new IOException("Certificate auth failed and no fallback credentials available");
             }
+
         }
+    }
+
+    private String extractAuthToken(
+            final HttpResponse<String> response, final JsonNode responseBody) {
+        final String bodyToken = responseBody.path("tok").asText(null);
+        if (bodyToken != null && !bodyToken.isBlank()) {
+            return bodyToken;
+        }
+        for (String setCookie : response.headers().allValues("Set-Cookie")) {
+            List<HttpCookie> cookies = HttpCookie.parse(setCookie);
+            for (HttpCookie cookie : cookies) {
+                if ("AuthToken".equalsIgnoreCase(cookie.getName())
+                        && cookie.getValue() != null
+                        && !cookie.getValue().isBlank()) {
+                    return cookie.getValue();
+                }
+            }
+        }
+        throw new IllegalStateException("CEMA authentication response did not contain an AuthToken");
     }
     
     private String extractCsrfToken(HttpResponse<String> response) {
@@ -216,8 +245,7 @@ public class RestClient {
             // Ignore parsing errors
         }
         
-        // Generate random CSRF token as fallback
-        return UUID.randomUUID().toString().replace("-", "");
+        throw new IllegalStateException("CEMA response did not contain a CSRF token");
     }
     
     /**
@@ -264,6 +292,51 @@ public class RestClient {
         } else {
             throw new IOException("Certificate issuance failed: " + resp.statusCode() + " - " + resp.body());
         }
+    }
+
+    /**
+     * Generate a key pair in CEMA and issue its certificate.
+     */
+    public CertificateResult generateCertificate(
+                final String kind, final Integer size, final String ecCurve, final String commonName)
+                throws IOException, InterruptedException {
+            String generateUrl = baseUrl + "/ca/" + caName + "/template/" + tplName + "/generate";
+            ObjectNode request = MAPPER.createObjectNode();
+            request.put("kind", kind);
+            if (size != null) {
+                request.put("size", size);
+            }
+            if (ecCurve != null && !ecCurve.isBlank()) {
+                request.put("ecCurve", ecCurve);
+            }
+            if (commonName != null && !commonName.isBlank()) {
+                request.put("commonName", commonName);
+            }
+            request.put("proto", "CMP");
+            request.put("returnIssuer", true);
+            request.put("returnChain", true);
+            request.put("returnRoot", false);
+            request.put("format", "DER");
+
+            HttpRequest httpRequest = HttpRequest.newBuilder()
+                    .uri(URI.create(generateUrl))
+                    .POST(HttpRequest.BodyPublishers.ofString(request.toString()))
+                    .header("Content-Type", "application/json")
+                    .header("X-CSRF-Token", csrfToken)
+                    .header("X-AuthToken", authToken)
+                    .header("Cookie", "AuthToken=" + authToken)
+                    .build();
+            HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() == 201) {
+                return parseCertificateResult(MAPPER.readTree(response.body()));
+            }
+            if (response.statusCode() == 202) {
+                JsonNode result = MAPPER.readTree(response.body());
+                String uuid = result.path("uuid").asText();
+                pendingRequests.put(uuid, new PendingRequest(uuid, 0));
+                return new CertificateResult(true, uuid, result.path("msg").asText());
+            }
+            throw new IOException("Key generation failed: " + response.statusCode() + " - " + response.body());
     }
     
     /**
@@ -381,6 +454,8 @@ public class RestClient {
         try {
             String certBase64 = result.path("cert").asText();
             byte[] certBytes = Base64.getDecoder().decode(certBase64);
+            String keyBase64 = result.path("key").asText("");
+            byte[] keyBytes = keyBase64.isEmpty() ? null : Base64.getDecoder().decode(keyBase64);
             
             String issuerBase64 = result.path("issuer").asText("");
             byte[] issuerBytes = issuerBase64.isEmpty() ? null : Base64.getDecoder().decode(issuerBase64);
@@ -399,7 +474,7 @@ public class RestClient {
             
             String uuid = result.path("uuid").asText();
             
-            return new CertificateResult(false, uuid, certBytes, issuerBytes, chainBytes, rootBytes);
+            return new CertificateResult(false, uuid, keyBytes, certBytes, issuerBytes, chainBytes, rootBytes);
         } catch (Exception e) {
             LOG.error("Failed to parse certificate result", e);
             throw new RuntimeException(e);
@@ -414,6 +489,7 @@ public class RestClient {
         public final String uuid;
         public final String message;
         public final byte[] certificate;
+        public final byte[] privateKey;
         public final byte[] issuer;
         public final byte[][] chain;
         public final byte[] root;
@@ -424,18 +500,20 @@ public class RestClient {
             this.uuid = uuid;
             this.message = message;
             this.certificate = null;
+            this.privateKey = null;
             this.issuer = null;
             this.chain = null;
             this.root = null;
         }
         
         // For completed results
-        public CertificateResult(boolean pending, String uuid, byte[] cert, byte[] issuer, 
+        public CertificateResult(boolean pending, String uuid, byte[] key, byte[] cert, byte[] issuer,
                                  byte[][] chain, byte[] root) {
             this.pending = pending;
             this.uuid = uuid;
             this.message = null;
             this.certificate = cert;
+            this.privateKey = key;
             this.issuer = issuer;
             this.chain = chain;
             this.root = root;
