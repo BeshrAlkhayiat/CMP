@@ -43,6 +43,9 @@ import org.bouncycastle.asn1.crmf.CertReqMsg;
 import org.bouncycastle.asn1.crmf.CertRequest;
 import org.bouncycastle.asn1.crmf.CertTemplate;
 import org.bouncycastle.asn1.pkcs.CertificationRequest;
+import org.bouncycastle.asn1.x500.AttributeTypeAndValue;
+import org.bouncycastle.asn1.x500.RDN;
+import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x500.style.BCStyle;
 import org.bouncycastle.asn1.x509.Certificate;
 import org.slf4j.Logger;
@@ -169,9 +172,18 @@ public final class CmpGateway {
                     Base64.getEncoder().encodeToString(request.getHeader().getTransactionID().getOctets());
             CertTemplate template = certReqMsg.getCertReq().getCertTemplate();
             if (template.getSubject() != null) {
-                var commonNames = template.getSubject().getRDNs(BCStyle.CN);
+                // CertTemplate.getSubject() returns the generic ASN1Encodable of the CHOICE
+                // (Name / RDNSequence); it must be narrowed to X500Name before its RDNs can be
+                // enumerated as an array.
+                final X500Name subject = X500Name.getInstance(template.getSubject());
+                final RDN[] commonNames = subject.getRDNs(BCStyle.CN);
                 if (commonNames.length > 0) {
-                    commonName = commonNames[0].getFirst().getValue().toString();
+                    final AttributeTypeAndValue firstCn = commonNames[0].getFirst();
+                    if (firstCn != null && firstCn.getValue() != null) {
+                        // getValue() returns ASN1Encodable; toString() gives the string form of
+                        // the CN value (e.g. DERUTF8String -> its text content).
+                        commonName = firstCn.getValue().toString();
+                    }
                 }
             }
             RestClient.CertificateResult result = awaitResult(
