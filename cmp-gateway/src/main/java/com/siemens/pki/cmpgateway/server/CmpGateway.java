@@ -7,6 +7,7 @@ package com.siemens.pki.cmpgateway.server;
 import com.siemens.pki.cmpracomponent.configuration.CmpMessageInterface;
 import com.siemens.pki.cmpracomponent.configuration.Configuration;
 import com.siemens.pki.cmpracomponent.configuration.CredentialContext;
+import com.siemens.pki.cmpracomponent.configuration.NestedEndpointContext;
 import com.siemens.pki.cmpracomponent.configuration.SharedSecretCredentialContext;
 import com.siemens.pki.cmpracomponent.configuration.VerificationContext;
 import com.siemens.pki.cmpracomponent.cryptoservices.AlgorithmHelper;
@@ -48,6 +49,9 @@ import org.bouncycastle.asn1.cmp.CMPCertificate;
 import org.bouncycastle.asn1.cmp.CertOrEncCert;
 import org.bouncycastle.asn1.cmp.CertRepMessage;
 import org.bouncycastle.asn1.cmp.CertResponse;
+import org.bouncycastle.asn1.cmp.GenMsgContent;
+import org.bouncycastle.asn1.cmp.GenRepContent;
+import org.bouncycastle.asn1.cmp.InfoTypeAndValue;
 import org.bouncycastle.asn1.cmp.PKIBody;
 import org.bouncycastle.asn1.cmp.PKIMessage;
 import org.bouncycastle.asn1.cmp.PKIStatus;
@@ -160,6 +164,8 @@ public final class CmpGateway {
                                             + " EnrollmentType: P10CR in the LCMP client config).");
                         }
                         return processCrmf(message, certProfile, persistencyContext);
+                    case PKIBody.TYPE_GEN_MSG:
+                        return handleGeneralMessage(message, certProfile, persistencyContext);
                     default:
                         throw new UnsupportedOperationException(
                                 "LCMP body type " + bodyType + " is not mapped to CEMA");
@@ -447,6 +453,13 @@ public final class CmpGateway {
                             public String getRecipient() {
                                 return upstreamConfig.getRecipient();
                             }
+
+                            @Override
+                            public boolean isIncomingRecipientValid(final String incomingSigner) {
+                                // Outbound-only context inside the upstream
+                                // callback: no inbound validation is performed.
+                                return true;
+                            }
                         },
                         StreamType.upstream(UPSTREAM_INTERFACE_NAME),
                         reusedCredentials);
@@ -489,9 +502,9 @@ public final class CmpGateway {
                 // Mirror the exact PBM parameter set of the request so that the
                 // client can verify our response with the same key derivation.
                 final ASN1OctetString salt = pbmParameter.getSalt();
-                final int iterationCount = pbmParameter.getOwfIterables().getIntPositiveValue();
+                final int iterationCount = pbmParameter.getIterationCount().intValueExact();
                 final String macAlgorithm = mapHmacOidToName(pbmParameter.getMac().getAlgorithm());
-                final String prf = mapDigestOidToName(pbmParameter.getOwfIterables().getAlgorithm());
+                final String prf = mapDigestOidToName(pbmParameter.getOwf().getAlgorithm());
                 final ASN1OctetString senderKid = header.getSenderKID();
                 return new SharedSecretCredentialContext() {
                     @Override
