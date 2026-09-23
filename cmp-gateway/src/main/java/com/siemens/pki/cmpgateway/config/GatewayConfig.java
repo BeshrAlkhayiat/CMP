@@ -155,6 +155,49 @@ public class GatewayConfig implements Configuration {
         return trustStore;
     }
     
+    /**
+     * Extract all X.509 certificates from the configured truststore to be used as
+     * trust anchors when validating signature-based CMP protection (e.g. upstream
+     * responses signed by the CA). Returns an empty list if no truststore is configured.
+     */
+    public List<X509Certificate> getTrustedCertificatesFromTrustStore() {
+        if (truststorePath == null || truststorePath.isEmpty()) {
+            return Collections.emptyList();
+        }
+        try {
+            KeyStore ts = loadTrustStore();
+            if (ts == null) {
+                return Collections.emptyList();
+            }
+            List<X509Certificate> result = new java.util.ArrayList<>();
+            java.util.Enumeration<String> aliases = ts.aliases();
+            while (aliases.hasMoreElements()) {
+                String alias = aliases.nextElement();
+                if (ts.isCertificateEntry(alias)) {
+                    java.security.cert.Certificate cert = ts.getCertificate(alias);
+                    if (cert instanceof X509Certificate) {
+                        result.add((X509Certificate) cert);
+                    }
+                } else if (ts.isKeyEntry(alias)) {
+                    java.security.cert.Certificate[] chain = ts.getCertificateChain(alias);
+                    if (chain != null) {
+                        for (java.security.cert.Certificate cert : chain) {
+                            if (cert instanceof X509Certificate) {
+                                result.add((X509Certificate) cert);
+                            }
+                        }
+                    }
+                }
+            }
+            LOG.info("Loaded " + result.size() + " trusted certificate(s) from truststore '"
+                    + truststorePath + "'");
+            return result;
+        } catch (Exception e) {
+            LOG.warn("could not load truststore '" + truststorePath + "' for CMP protection validation", e);
+            return Collections.emptyList();
+        }
+    }
+
     public List<X509Certificate> getCertificateChain() throws Exception {
         KeyStore ks = loadKeyStore();
         if (ks == null) {
@@ -254,7 +297,11 @@ public class GatewayConfig implements Configuration {
                     
                     @Override
                     public Collection<X509Certificate> getTrustedCertificates() {
-                        return Collections.emptyList(); // Accept all for now
+                        // Trust anchors for signature-protected downstream requests.
+                        // null disables certificate-path validation (accept any signer);
+                        // an empty collection would make PKIX path building fail with
+                        // "the trustAnchors parameter must be non-empty".
+                        return null;
                     }
                 };
             }
@@ -308,7 +355,9 @@ public class GatewayConfig implements Configuration {
         return new VerificationContext() {
             @Override
             public Collection<X509Certificate> getTrustedCertificates() {
-                return Collections.emptyList(); // Configure as needed
+                // No enrollment trust configured: return null to skip certificate-path
+                // validation instead of an empty list (which breaks PKIX path building).
+                return null;
             }
         };
     }
@@ -352,7 +401,13 @@ public class GatewayConfig implements Configuration {
                 return new VerificationContext() {
                     @Override
                     public Collection<X509Certificate> getTrustedCertificates() {
-                        return Collections.emptyList();
+                        // Trust anchors for validating signature-protected upstream
+                        // responses: the certificates from the configured truststore.
+                        // If none are configured, return null to skip path validation
+                        // rather than an empty list, which fails with
+                        // "the trustAnchors parameter must be non-empty".
+                        List<X509Certificate> trusted = getTrustedCertificatesFromTrustStore();
+                        return trusted.isEmpty() ? null : trusted;
                     }
                 };
             }
