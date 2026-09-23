@@ -229,6 +229,27 @@ public class GatewayConfig implements Configuration {
         }
         return (PrivateKey) ks.getKey(keyAlias, keystorePassword.toCharArray());
     }
+
+    /**
+     * The gateway's own signature-protection certificate (leaf of the configured
+     * key-store chain), as an ASN.1 structure for embedding in CMP messages
+     * (e.g. id-it-caProtEncCert general-message answers). Returns {@code null}
+     * if no signer certificate is available.
+     */
+    public org.bouncycastle.asn1.x509.Certificate getSignerCertificateOrNull() {
+        try {
+            List<X509Certificate> chain = getCertificateChain();
+            if (chain.isEmpty()) {
+                return null;
+            }
+            return org.bouncycastle.asn1.x509.Certificate.getInstance(
+                    org.bouncycastle.asn1.ASN1Primitive.fromByteArray(
+                            chain.get(0).getEncoded()));
+        } catch (Exception e) {
+            LOG.warn("could not obtain gateway signer certificate", e);
+            return null;
+        }
+    }
     
     // Configuration interface implementation
     

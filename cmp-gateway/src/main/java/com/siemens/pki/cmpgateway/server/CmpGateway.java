@@ -351,6 +351,77 @@ public final class CmpGateway {
             return result;
         }
 
+        /**
+         * Handle an LCMP General Message (GenMsg, RFC 4210 section 5.2.3).
+         *
+         * <p>The CEMA backend has no CMP general-message endpoint, so the gateway
+         * answers the informational requests it can serve locally:</p>
+         * <ul>
+         *   <li>{@code id-it-certTemplates} (1.3.6.1.5.5.7.48.1.9): returns the
+         *       configured CA name and certificate template as a free-text infoVal -
+         *       a simple way to check that the gateway round-trip works.</li>
+         *   <li>{@code id-it-caProtEncCert} (1.3.6.1.5.5.7.48.1.2): returns the
+         *       gateway's own signer certificate if it is available from the
+         *       keystore configuration.</li>
+         *   <li>Anything else: rejected with a readable status text instead of a
+         *       transport-level error, so clients see a proper GenRep.</li>
+         * </ul>
+         */
+        private byte[] handleGeneralMessage(
+                final PKIMessage request, final String certProfile,
+                final PersistencyContext persistencyContext) throws Exception {
+            final GenMsgContent genMsg = GenMsgContent.getInstance(request.getBody().getContent());
+            final InfoTypeAndValue[] requests = genMsg.toInfoTypeAndValueArray();
+            if (requests.length == 0) {
+                throw new IllegalArgumentException("GenMsg contains no infoTypeAndValues");
+            }
+            final java.util.List<InfoTypeAndValue> responses = new java.util.ArrayList<>();
+            for (InfoTypeAndValue info : requests) {
+                final String oid = info.getInfoType().getId();
+                switch (oid) {
+                    case "1.3.6.1.5.5.7.48.1.9": // id-it-certTemplates
+                        responses.add(new InfoTypeAndValue(
+                                info.getInfoType(),
+                                new org.bouncycastle.asn1.DERUTF8String(
+                                        "CA=" + config.getCaName()
+                                                + ",template=" + config.getTplName())));
+                        break;
+                    case "1.3.6.1.5.5.7.48.1.2": { // id-it-caProtEncCert
+                        org.bouncycastle.asn1.x509.Certificate signer =
+                                config.getSignerCertificateOrNull();
+                        if (signer == null) {
+                            responses.add(rejectedInfo(info,
+                                    "no gateway protection certificate is configured"));
+                        } else {
+                            responses.add(new InfoTypeAndValue(
+                                    info.getInfoType(),
+                                    new CMPCertificate(signer)));
+                        }
+                        break;
+                    }
+                    default:
+                        responses.add(rejectedInfo(info,
+                                "general message topic " + oid + " is not served by this gateway"));
+                        break;
+                }
+            }
+            LOG.info("answered GenMsg with {} infoTypeAndValue response(s)", responses.size());
+            final PKIBody responseBody = new PKIBody(
+                    PKIBody.TYPE_GEN_REP,
+                    new GenRepContent(responses.toArray(new InfoTypeAndValue[0])));
+            return protectUpstreamResponse(request, persistencyContext, responseBody).getEncoded();
+        }
+
+        private static InfoTypeAndValue rejectedInfo(
+                final InfoTypeAndValue request, final String text) {
+            return new InfoTypeAndValue(
+                    request.getInfoType(),
+                    new org.bouncycastle.asn1.cmp.PKIStatusInfo(
+                            PKIStatus.rejection,
+                            new org.bouncycastle.asn1.cmp.PKIFreeText(text),
+                            null));
+        }
+
         private byte[] revoke(final PKIMessage request) throws Exception {
             final RevReqContent content = RevReqContent.getInstance(request.getBody().getContent());
             if (content.toRevDetailsArray().length == 0
