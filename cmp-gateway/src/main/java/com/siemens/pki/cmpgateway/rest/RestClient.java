@@ -131,11 +131,11 @@ public class RestClient {
     private void authenticateBasic() throws IOException, InterruptedException {
         LOG.info("Authenticating with basic auth for user: {}", username);
         
-        // Step 1: Identify
+        // Step 1: Identify (POST /auth/identify). Per the OpenAPI spec, a UserLoginRequest
+        // contains only the "user" name.
         String identifyUrl = baseUrl + "/auth/identify";
         ObjectNode identifyRequest = MAPPER.createObjectNode();
         identifyRequest.put("user", username);
-        identifyRequest.put("domain", "");
         
         HttpRequest identifyReq = HttpRequest.newBuilder()
                 .uri(URI.create(identifyUrl))
@@ -163,11 +163,11 @@ public class RestClient {
         LOG.info("Authenticating with client certificate");
 
         // Step 1: Identify the user (POST /auth/identify). The TLS client certificate presented
-        // during the handshake maps to this user on the server side.
+        // during the handshake maps to this user on the server side. Per the OpenAPI spec, a
+        // UserLoginRequest contains only the "user" name.
         String identifyUrl = baseUrl + "/auth/identify";
         ObjectNode identifyRequest = MAPPER.createObjectNode();
         identifyRequest.put("user", username != null && !username.isBlank() ? username : "TenantAdmin");
-        identifyRequest.put("domain", "");
 
         HttpRequest identifyReq = HttpRequest.newBuilder()
                 .uri(URI.create(identifyUrl))
@@ -182,14 +182,18 @@ public class RestClient {
             storeCookies(setCookie);
         }
 
-        // If the client certificate was accepted, /auth/identify may return a completed
-        // AuthResponse directly (AuthToken cookie set) instead of a password challenge.
+        // If the client certificate was accepted, /auth/identify returns a completed AuthResponse
+        // directly (an AuthToken cookie is set and no "challenge" object is present) instead of a
+        // pending AuthChallenge. Only when a challenge actually exists do we need to call
+        // /auth/login: per the OpenAPI spec, AuthChallengeResponse requires ctx, kind, token and
+        // response, and sending an empty/garbage body makes CEMA reject it with HTTP 400
+        // ("*pKind* is null").
         if (identifyResp.statusCode() == 200) {
             JsonNode identifyNode = readJsonOrEmpty(identifyResp.body());
             String cookieToken = sessionCookies.get("authtoken");
             boolean haveSession = cookieToken != null && !cookieToken.isBlank();
-            boolean certAccepted = haveSession
-                    || ("success".equalsIgnoreCase(identifyNode.path("ctx").path("status").asText("")));
+            boolean challengePending = identifyNode.hasNonNull("challenge");
+            boolean certAccepted = haveSession || !challengePending;
             if (certAccepted) {
                 this.authToken = extractAuthToken(identifyResp, identifyNode);
                 this.csrfToken = extractCsrfToken(identifyResp);
@@ -198,9 +202,8 @@ public class RestClient {
             }
         }
 
-        // Step 2: Complete the login (POST /auth/login) answering the challenge from identify.
-        // With certificate auth there is no password value to supply, so the challenge token is
-        // echoed back with an empty value.
+        // Step 2: The certificate alone did not complete authentication; CEMA expects us to answer
+        // the AuthChallenge returned by /auth/identify via POST /auth/login.
         LOG.info("Certificate auth requires login step, calling /auth/login");
         completeLogin(identifyResp, "");
     }
@@ -208,15 +211,33 @@ public class RestClient {
     /**
      * Complete a two-step login: POST /auth/login answering the challenge returned by a previous
      * /auth/identify response. Shared by the basic-auth and certificate-auth flows.
+     *
+     * <p>The request body must be a valid AuthChallengeResponse per the CEMA OpenAPI spec, whose
+     * required fields are {@code ctx}, {@code kind}, {@code token} and {@code response}. Sending
+     * anything less (e.g. only "token"/"value") makes CEMA reject the request with
+     * HTTP 400 "invalid JSON body for type AuthChallengeResponseImpl: ... *pKind* is null".
+     * Therefore the full challenge object (kind, params, token) and the session context (ctx)
+     * are echoed back from the /auth/identify response, with "response" carrying the credential.
      */
     private void completeLogin(final HttpResponse<String> identifyResp, final String credentialValue)
             throws IOException, InterruptedException {
         JsonNode identifyNode = readJsonOrEmpty(identifyResp.body());
+        JsonNode challenge = identifyNode.path("challenge");
+        if (!challenge.isObject()) {
+            throw new IOException("Cannot complete login: /auth/identify response (HTTP "
+                    + identifyResp.statusCode() + ") contained no AuthChallenge to answer - "
+                    + abbreviate(identifyResp.body()));
+        }
 
         String loginUrl = baseUrl + "/auth/login";
         ObjectNode loginRequest = MAPPER.createObjectNode();
-        loginRequest.put("token", identifyNode.path("challenge").path("token").asText(""));
-        loginRequest.put("value", credentialValue);
+        loginRequest.set("ctx", identifyNode.path("ctx"));
+        loginRequest.put("kind", challenge.path("kind").asText(""));
+        if (challenge.hasNonNull("params")) {
+            loginRequest.put("params", challenge.path("params").asText());
+        }
+        loginRequest.put("token", challenge.path("token").asText(""));
+        loginRequest.put("response", credentialValue);
 
         HttpRequest.Builder loginBuilder = HttpRequest.newBuilder()
                 .uri(URI.create(loginUrl))
