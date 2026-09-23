@@ -484,6 +484,10 @@ public class RestClient {
      * IllegalArgumentException: "Illegal character in path".
      * URLEncoder encodes for application/x-www-form-urlencoded, so additionally convert
      * '+' (which denotes a space only in query strings, not paths) to %20.
+     *
+     * <p><b>Important:</b> the encoded name is used ONLY inside the request URI. The CA name
+     * embedded in JSON bodies (e.g. the "caName" field of a revoke request) must stay in its
+     * unencoded form, since CEMA looks those values up directly in its object store.
      */
     private static String encodePathSegment(String segment) {
         return URLEncoder.encode(segment, StandardCharsets.UTF_8).replace("+", "%20");
@@ -512,10 +516,22 @@ public class RestClient {
     }
 
     /**
-     * Find the server's exact spelling of a CA name using a case-insensitive comparison.
+     * Normalize a CA/template name for tolerant comparison: trimmed, whitespace runs collapsed
+     * to a single space, lower-cased. This absorbs the cosmetic differences that show up between
+     * how operators write ca.name in gateway.properties ("CEMA User CA") and how the CA is
+     * registered on the server ("CEMA-User-CA", "cema user ca", ...).
+     */
+    private static String normalizeName(final String name) {
+        return name == null ? "" : name.trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", " ");
+    }
+
+    /**
+     * Find the server's exact spelling of a CA name using a tolerant (case- and
+     * separator-insensitive) comparison.
      * CEMA stores each CAConfig under a lower-cased name ("lowerName") but returns the original
-     * display name from GET /ca; matching tolerates differences in capitalization between the
-     * configured ca.name and the registered CA.
+     * display name from GET /ca; matching tolerates differences in capitalization and
+     * space/hyphen/underscore separators between the configured ca.name and the registered CA.
+     * An exact match always wins over a fuzzy one.
      *
      * @return the matching CA name as reported by the server, or null if no CA matches
      */
@@ -524,8 +540,26 @@ public class RestClient {
             return null;
         }
         try {
-            for (String serverName : listCaNames()) {
+            List<String> serverNames = listCaNames();
+            // Pass 1: exact match.
+            for (String serverName : serverNames) {
+                if (serverName.equals(wanted)) {
+                    return serverName;
+                }
+            }
+            // Pass 2: case-insensitive match.
+            for (String serverName : serverNames) {
                 if (serverName.equalsIgnoreCase(wanted)) {
+                    return serverName;
+                }
+            }
+            // Pass 3: fully normalized match (ignores spaces vs. hyphens/underscores, e.g.
+            // configured "CEMA User CA" resolves to registered "CEMA-User-CA").
+            final String wantedNorm = normalizeName(wanted)
+                    .replace('-', ' ').replace('_', ' ');
+            for (String serverName : serverNames) {
+                String norm = normalizeName(serverName).replace('-', ' ').replace('_', ' ');
+                if (norm.equals(wantedNorm)) {
                     return serverName;
                 }
             }
