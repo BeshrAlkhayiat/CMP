@@ -15,10 +15,13 @@ import com.siemens.pki.cmpracomponent.main.CmpRaComponent.CmpRaInterface;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent.UpstreamExchange;
 import com.siemens.pki.cmpracomponent.msggeneration.MsgOutputProtector;
 import com.siemens.pki.cmpracomponent.msggeneration.PkiMessageGenerator;
+import com.siemens.pki.cmpracomponent.msgprocessing.StreamType;
+import com.siemens.pki.cmpracomponent.msgvalidation.BaseCmpException;
+import com.siemens.pki.cmpracomponent.msgvalidation.CmpValidationException;
+import com.siemens.pki.cmpracomponent.msgvalidation.InputValidator;
 import com.siemens.pki.cmpracomponent.msgvalidation.MessageContext;
 import com.siemens.pki.cmpracomponent.msgvalidation.MessageHeaderValidator;
 import com.siemens.pki.cmpracomponent.persistency.PersistencyContext;
-import com.siemens.pki.cmpracomponent.msgprocessing.StreamType;
 import com.siemens.pki.cmpracomponent.protection.OutputSharedSecretCredentials;
 import com.siemens.pki.cmpgateway.config.GatewayConfig;
 import com.siemens.pki.cmpgateway.rest.RestClient;
@@ -103,6 +106,16 @@ public final class CmpGateway {
     }
 
     private final class RestUpstream implements UpstreamExchange, CmpRaComponent.GeneratedKeyProvider {
+
+        private static final String UPSTREAM_INTERFACE_NAME = "CMP upstream";
+
+        /**
+         * Tracks the transaction state of the request currently being processed
+         * by {@link #sendReceiveMessage(byte[], String, int)}, which is invoked
+         * synchronously while the RA component handles the downstream request.
+         */
+        private final ThreadLocal<PersistencyContext> currentTransaction = new ThreadLocal<>();
+
         private final Map<String, PrivateKey> generatedKeys = new ConcurrentHashMap<>();
         private final Map<String, Boolean> centralKeyRequests = new ConcurrentHashMap<>();
 
@@ -120,18 +133,28 @@ public final class CmpGateway {
         public byte[] sendReceiveMessage(
                 final byte[] request, final String certProfile, final int bodyType) throws Exception {
             final PKIMessage message = parseMessage(request);
-            switch (bodyType) {
-                case PKIBody.TYPE_P10_CERT_REQ:
-                    return issuePkcs10(message, certProfile);
-                case PKIBody.TYPE_REVOCATION_REQ:
-                    return revoke(message);
-                case PKIBody.TYPE_INIT_REQ:
-                case PKIBody.TYPE_CERT_REQ:
-                case PKIBody.TYPE_KEY_UPDATE_REQ:
-                    return processCrmf(message, certProfile);
-                default:
-                    throw new UnsupportedOperationException(
-                            "LCMP body type " + bodyType + " is not mapped to CEMA");
+            // Remember the transaction of the request being processed so that the
+            // generated upstream responses can be protected with the matching
+            // credentials (see protectUpstreamResponse).
+            final PersistencyContext persistencyContext = new PersistencyContext();
+            persistencyContext.setRequestType(bodyType);
+            currentTransaction.set(persistencyContext);
+            try {
+                switch (bodyType) {
+                    case PKIBody.TYPE_P10_CERT_REQ:
+                        return issuePkcs10(message, certProfile, persistencyContext);
+                    case PKIBody.TYPE_REVOCATION_REQ:
+                        return revoke(message);
+                    case PKIBody.TYPE_INIT_REQ:
+                    case PKIBody.TYPE_CERT_REQ:
+                    case PKIBody.TYPE_KEY_UPDATE_REQ:
+                        return processCrmf(message, certProfile, persistencyContext);
+                    default:
+                        throw new UnsupportedOperationException(
+                                "LCMP body type " + bodyType + " is not mapped to CEMA");
+                }
+            } finally {
+                currentTransaction.remove();
             }
         }
 
@@ -274,7 +297,10 @@ public final class CmpGateway {
         }
 
         private byte[] certificateResponse(
-                final PKIMessage request, final BigInteger certReqId, final byte[] encodedCertificate)
+                final PKIMessage request,
+                final PersistencyContext persistencyContext,
+                final BigInteger certReqId,
+                final byte[] encodedCertificate)
                 throws Exception {
             final Certificate certificate = Certificate.getInstance(
                     ASN1Primitive.fromByteArray(encodedCertificate));
@@ -289,9 +315,57 @@ public final class CmpGateway {
                     : request.getBody().getType() + 1;
             final PKIBody responseBody = new PKIBody(
                     responseType, new CertRepMessage(null, new CertResponse[] {response}));
-            return PkiMessageGenerator.generateUnprotectMessage(
-                            PkiMessageGenerator.buildRespondingHeaderProvider(request), responseBody)
-                    .getEncoded();
+            return protectUpstreamResponse(request, persistencyContext, responseBody).getEncoded();
+        }
+
+        /**
+         * Protect an upstream (RA-side) response with the same credentials that
+         * were used to protect the related downstream request.
+         *
+         * <p>The RA component validates every message coming back from the
+         * upstream exchange through
+         * {@link com.siemens.pki.cmpracomponent.msgvalidation.ProtectionValidator}
+         * using {@code Configuration.getUpstreamConfiguration()}. Since CEMA is
+         * driven over plain REST and returns unprotected CMP structures, the
+         * gateway must add protection itself before handing the response back to
+         * the RA component; otherwise validation fails with
+         * "message is incomplete protected but protection is required".</p>
+         */
+        private PKIMessage protectUpstreamResponse(
+                final PKIMessage request,
+                final PersistencyContext persistencyContext,
+                final PKIBody responseBody)
+                throws Exception {
+            // Reuse the credentials that protected the incoming downstream request
+            // (MAC/shared-secret or signature) for the upstream response, exactly as
+            // the RA component does when relaying messages in both directions.
+            MessageContext messageContext = null;
+            try {
+                messageContext = new InputValidator(
+                                UPSTREAM_INTERFACE_NAME,
+                                config::getDownstreamConfiguration,
+                                (x, y) -> false,
+                                java.util.Arrays.asList(
+                                        PKIBody.TYPE_INIT_REQ,
+                                        PKIBody.TYPE_CERT_REQ,
+                                        PKIBody.TYPE_KEY_UPDATE_REQ,
+                                        PKIBody.TYPE_P10_CERT_REQ,
+                                        PKIBody.TYPE_REVOCATION_REQ,
+                                        PKIBody.TYPE_POLL_REQ,
+                                        PKIBody.TYPE_CERT_CONFIRM,
+                                        PKIBody.TYPE_GEN_MSG),
+                                persistencyContext)
+                        .validate(request);
+            } catch (final BaseCmpException exception) {
+                LOG.warn("could not reuse downstream request credentials for upstream response "
+                        + "protection, falling back to configured output credentials: {}",
+                        exception.getMessage());
+            }
+            final MsgOutputProtector protector = new MsgOutputProtector(
+                    config.getUpstreamConfiguration(persistencyContext.getCertProfile(), responseBody.getType()),
+                    StreamType.upstream(UPSTREAM_INTERFACE_NAME),
+                    messageContext);
+            return protector.generateAndProtectResponseTo(request, responseBody);
         }
     }
 
