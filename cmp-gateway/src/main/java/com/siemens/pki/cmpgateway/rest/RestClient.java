@@ -477,7 +477,11 @@ public class RestClient {
         
         ObjectNode request = MAPPER.createObjectNode();
         request.put("csr", csr);
-        request.put("proto", "CMP");
+        // Per the CEMA OpenAPI spec, "proto" must be an EnrollmentProtocol enum value.
+        // CMP is NOT a valid constant (allowed: ACME, AUTO, EST, EXTERNAL, LCEP, REST, SCEP, MAIL, MANUAL, PRINTER),
+        // so sending "CMP" causes HTTP 400 "No enum constant ...EnrollmentProtocol.CMP".
+        // Use "REST" (the schema default) since this gateway talks to CEMA via its REST API.
+        request.put("proto", "REST");
         request.put("returnIssuer", true);
         request.put("returnChain", true);
         request.put("returnRoot", false);
@@ -526,7 +530,8 @@ public class RestClient {
             if (commonName != null && !commonName.isBlank()) {
                 request.put("commonName", commonName);
             }
-            request.put("proto", "CMP");
+            // "proto" must be a valid EnrollmentProtocol enum value; "CMP" is not one (see issueCertificate).
+            request.put("proto", "REST");
             request.put("returnIssuer", true);
             request.put("returnChain", true);
             request.put("returnRoot", false);
@@ -561,7 +566,8 @@ public class RestClient {
         
         ObjectNode request = MAPPER.createObjectNode();
         request.put("csr", csr);
-        request.put("proto", "CMP");
+        // "proto" must be a valid EnrollmentProtocol enum value; "CMP" is not one (see issueCertificate).
+        request.put("proto", "REST");
         request.put("returnIssuer", true);
         request.put("returnChain", true);
         request.put("returnRoot", false);
