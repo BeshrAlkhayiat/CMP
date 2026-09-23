@@ -21,7 +21,9 @@ import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.security.SecureRandom;
 import java.util.Base64;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.List;
@@ -41,7 +43,15 @@ public class RestClient {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     
     private final String baseUrl;
-    private final String caName;
+    /**
+     * The CA name actually used for all upstream calls. CEMA looks up its CAConfig objects by a
+     * lower-cased name ("lowerName"), so the configured display name (e.g. "CEMA User CA") is
+     * resolved against GET /ca (the list of CA names the caller is authorized for) and replaced
+     * by the server's exact spelling as soon as a case-insensitive match is found. Falls back to
+     * the configured name if the lookup fails or no CA matches.
+     */
+    private volatile String caName;
+    private final String configuredCaName;
     private final String tplName;
     private final String lookupName;
     private final String authType;
@@ -79,6 +89,7 @@ public class RestClient {
                       KeyStore keyStore, String keystorePassword, String keyAlias,
                       KeyStore trustStore) throws Exception {
         this.baseUrl = baseUrl;
+        this.configuredCaName = caName;
         this.caName = caName;
         this.tplName = tplName;
         this.lookupName = lookupName;
@@ -479,11 +490,177 @@ public class RestClient {
     }
 
     /**
+     * Fetch the list of active CA names the authenticated caller is authorized for
+     * (GET /ca, "CANameListResponse": a plain JSON array of strings).
+     */
+    public List<String> listCaNames() throws IOException, InterruptedException {
+        HttpRequest req = addAuthHeaders(HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/ca"))
+                .GET()).build();
+        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            throw new IOException("Listing CAs failed: " + resp.statusCode() + " - " + abbreviate(resp.body()));
+        }
+        List<String> names = new ArrayList<>();
+        JsonNode root = MAPPER.readTree(resp.body());
+        if (root.isArray()) {
+            for (JsonNode name : root) {
+                names.add(name.asText());
+            }
+        }
+        return names;
+    }
+
+    /**
+     * Find the server's exact spelling of a CA name using a case-insensitive comparison.
+     * CEMA stores each CAConfig under a lower-cased name ("lowerName") but returns the original
+     * display name from GET /ca; matching tolerates differences in capitalization between the
+     * configured ca.name and the registered CA.
+     *
+     * @return the matching CA name as reported by the server, or null if no CA matches
+     */
+    private String findMatchingCaName(final String wanted) {
+        if (wanted == null || wanted.isBlank()) {
+            return null;
+        }
+        try {
+            for (String serverName : listCaNames()) {
+                if (serverName.equalsIgnoreCase(wanted)) {
+                    return serverName;
+                }
+            }
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            LOG.warn("Could not resolve CA name '{}' against GET /ca: {}", wanted, e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Ensure {@link #caName} holds the server's exact CA spelling before issuing requests that
+     * embed it in the path. Resolution happens once per (configured) name; a failure to resolve
+     * simply keeps the configured value so the request still goes out with a meaningful error.
+     */
+    private void ensureCaNameResolved() {
+        String resolved = findMatchingCaName(configuredCaName);
+        if (resolved != null && !resolved.equals(caName)) {
+            LOG.info("Resolved configured CA name '{}' to server name '{}'", configuredCaName, resolved);
+            this.caName = resolved;
+        }
+    }
+
+    /**
+     * True if a REST error body reports that the CA object could not be found on the server,
+     * e.g. {@code MissingObjectException: missing CAConfig with lowerName 'cema user ca'}.
+     */
+    private static boolean isMissingCaError(final String body) {
+        if (body == null) {
+            return false;
+        }
+        String lower = body.toLowerCase(Locale.ROOT);
+        return lower.contains("missingobjectexception") && lower.contains("caconfig");
+    }
+
+    /**
+     * Turn a failed CA-scoped request into an IOException, adding diagnostic information when
+     * CEMA reports that the CAConfig object does not exist: the list of CA names the
+     * authenticated account can actually access and, for those CAs, their template names.
+     */
+    private IOException caScopedFailure(final String operation, final int status, final String body) {
+        if (status == 404 && isMissingCaError(body)) {
+            return new IOException(operation + " failed: " + status + " - " + describeUnknownCa(body)
+                    + describeTemplatesOfAvailableCas());
+        }
+        return new IOException(operation + " failed: " + status + " - " + body);
+    }
+
+    /**
+     * Best-effort listing of the templates configured for each accessible CA, appended to the
+     * "unknown CA" diagnostic so operators can immediately see which ca.name/template.name
+     * combinations are valid. Any error during this purely informational query is swallowed.
+     */
+    private String describeTemplatesOfAvailableCas() {
+        StringBuilder sb = new StringBuilder();
+        try {
+            for (String ca : listCaNames()) {
+                List<String> templates;
+                try {
+                    templates = listTemplateNames(ca);
+                } catch (IOException | InterruptedException e) {
+                    if (e instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                    }
+                    continue;
+                }
+                sb.append(" CA '").append(ca).append("' offers templates ").append(templates).append(";");
+            }
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            // Informational only - ignore failures here.
+        }
+        return sb.length() > 0 ? " Template inventory:" + sb : "";
+    }
+
+    /**
+     * Fetch the list of template names configured for a CA (GET /ca/{caName}/template).
+     */
+    public List<String> listTemplateNames(String ca) throws IOException, InterruptedException {
+        HttpRequest req = addAuthHeaders(HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/ca/" + encodePathSegment(ca) + "/template"))
+                .GET()).build();
+        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            throw new IOException("Listing templates failed: " + resp.statusCode() + " - " + abbreviate(resp.body()));
+        }
+        List<String> names = new ArrayList<>();
+        JsonNode root = MAPPER.readTree(resp.body());
+        if (root.isArray()) {
+            for (JsonNode name : root) {
+                names.add(name.asText());
+            }
+        }
+        return names;
+    }
+
+    /**
+     * Build a helpful message when the requested CA (or template) does not exist on the server,
+     * listing the CA names the authenticated account can actually access.
+     */
+    private String describeUnknownCa(String body) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("CEMA has no CA named '").append(caName).append("'");
+        if (configuredCaName != null && !configuredCaName.equals(caName)) {
+            sb.append(" (resolved from configured name '").append(configuredCaName).append("')");
+        }
+        sb.append(". Server response: ").append(abbreviate(body));
+        try {
+            List<String> available = listCaNames();
+            if (!available.isEmpty()) {
+                sb.append(" Available CAs for this account: ").append(available).append(".");
+            } else {
+                sb.append(" The authenticated account has access to no CAs at all (GET /ca returned an empty list)"
+                        + " - check that the login user holds the CA_ACCESS privilege.");
+            }
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            sb.append(" (could not list available CAs: ").append(e.getMessage()).append(")");
+        }
+        return sb.toString();
+    }
+
+    /**
      * Issue certificate using template-based approach.
      * @param csr Base64-encoded PKCS#10 CSR
      * @return IssuedCertificateData or PendingRequest info
      */
     public CertificateResult issueCertificate(String csr) throws IOException, InterruptedException {
+        ensureCaNameResolved();
         LOG.info("Issuing certificate for CA: {}, Template: {}", caName, tplName);
         
         String issueUrl = baseUrl + "/ca/" + encodePathSegment(caName) + "/template/" + encodePathSegment(tplName) + "/issue";
@@ -521,7 +698,7 @@ public class RestClient {
             pendingRequests.put(uuid, new PendingRequest(uuid, 2)); // 2 = CR body type
             return new CertificateResult(true, uuid, result.path("msg").asText());
         } else {
-            throw new IOException("Certificate issuance failed: " + resp.statusCode() + " - " + resp.body());
+            throw caScopedFailure("Certificate issuance", resp.statusCode(), resp.body());
         }
     }
 
@@ -531,6 +708,7 @@ public class RestClient {
     public CertificateResult generateCertificate(
                 final String kind, final Integer size, final String ecCurve, final String commonName)
                 throws IOException, InterruptedException {
+            ensureCaNameResolved();
             String generateUrl = baseUrl + "/ca/" + encodePathSegment(caName) + "/template/" + encodePathSegment(tplName) + "/generate";
             ObjectNode request = MAPPER.createObjectNode();
             request.put("kind", kind);
@@ -565,7 +743,7 @@ public class RestClient {
                 pendingRequests.put(uuid, new PendingRequest(uuid, 0));
                 return new CertificateResult(true, uuid, result.path("msg").asText());
             }
-            throw new IOException("Key generation failed: " + response.statusCode() + " - " + response.body());
+            throw caScopedFailure("Key generation", response.statusCode(), response.body());
     }
     
     /**
@@ -613,6 +791,7 @@ public class RestClient {
      * @param reason Revocation reason code
      */
     public boolean revokeCertificate(String serial, int reason) throws IOException, InterruptedException {
+        ensureCaNameResolved();
         LOG.info("Revoking certificate with serial: {}, reason: {}", serial, reason);
         
         String revokeUrl = baseUrl + "/ca/" + encodePathSegment(caName) + "/revoke";
@@ -633,7 +812,7 @@ public class RestClient {
             LOG.info("Certificate revoked successfully");
             return true;
         } else {
-            throw new IOException("Certificate revocation failed: " + resp.statusCode() + " - " + resp.body());
+            throw caScopedFailure("Certificate revocation", resp.statusCode(), resp.body());
         }
     }
     
@@ -642,6 +821,7 @@ public class RestClient {
      * @param uuid UUID of pending request
      */
     public CertificateResult fetchPendingCertificate(String uuid) throws IOException, InterruptedException {
+        ensureCaNameResolved();
         LOG.info("Fetching pending certificate: {}", uuid);
         
         String fetchUrl = baseUrl + "/ca/" + encodePathSegment(caName) + "/fetch";
@@ -667,7 +847,7 @@ public class RestClient {
             JsonNode result = MAPPER.readTree(resp.body());
             return new CertificateResult(true, uuid, result.path("msg").asText());
         } else {
-            throw new IOException("Fetch failed: " + resp.statusCode() + " - " + resp.body());
+            throw caScopedFailure("Fetch", resp.statusCode(), resp.body());
         }
     }
     
