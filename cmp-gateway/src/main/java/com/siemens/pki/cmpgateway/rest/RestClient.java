@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.net.URI;
 import java.net.HttpCookie;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -466,6 +467,18 @@ public class RestClient {
     }
 
     /**
+     * Percent-encode a value for safe use as a URI path segment. CA and template names may
+     * legally contain characters that are illegal in a URI (e.g. spaces, as in
+     * "CEMA User CA"), which would otherwise cause {@link URI#create(String)} to throw
+     * IllegalArgumentException: "Illegal character in path".
+     * URLEncoder encodes for application/x-www-form-urlencoded, so additionally convert
+     * '+' (which denotes a space only in query strings, not paths) to %20.
+     */
+    private static String encodePathSegment(String segment) {
+        return URLEncoder.encode(segment, StandardCharsets.UTF_8).replace("+", "%20");
+    }
+
+    /**
      * Issue certificate using template-based approach.
      * @param csr Base64-encoded PKCS#10 CSR
      * @return IssuedCertificateData or PendingRequest info
@@ -473,7 +486,7 @@ public class RestClient {
     public CertificateResult issueCertificate(String csr) throws IOException, InterruptedException {
         LOG.info("Issuing certificate for CA: {}, Template: {}", caName, tplName);
         
-        String issueUrl = baseUrl + "/ca/" + caName + "/template/" + tplName + "/issue";
+        String issueUrl = baseUrl + "/ca/" + encodePathSegment(caName) + "/template/" + encodePathSegment(tplName) + "/issue";
         
         ObjectNode request = MAPPER.createObjectNode();
         request.put("csr", csr);
@@ -518,7 +531,7 @@ public class RestClient {
     public CertificateResult generateCertificate(
                 final String kind, final Integer size, final String ecCurve, final String commonName)
                 throws IOException, InterruptedException {
-            String generateUrl = baseUrl + "/ca/" + caName + "/template/" + tplName + "/generate";
+            String generateUrl = baseUrl + "/ca/" + encodePathSegment(caName) + "/template/" + encodePathSegment(tplName) + "/generate";
             ObjectNode request = MAPPER.createObjectNode();
             request.put("kind", kind);
             if (size != null) {
@@ -562,7 +575,7 @@ public class RestClient {
     public CertificateResult autoIssueCertificate(String csr) throws IOException, InterruptedException {
         LOG.info("Auto-issuing certificate with lookup: {}", lookupName);
         
-        String issueUrl = baseUrl + "/ca/auto-issue/" + lookupName;
+        String issueUrl = baseUrl + "/ca/auto-issue/" + encodePathSegment(lookupName);
         
         ObjectNode request = MAPPER.createObjectNode();
         request.put("csr", csr);
@@ -602,7 +615,7 @@ public class RestClient {
     public boolean revokeCertificate(String serial, int reason) throws IOException, InterruptedException {
         LOG.info("Revoking certificate with serial: {}, reason: {}", serial, reason);
         
-        String revokeUrl = baseUrl + "/ca/" + caName + "/revoke";
+        String revokeUrl = baseUrl + "/ca/" + encodePathSegment(caName) + "/revoke";
         
         ObjectNode request = MAPPER.createObjectNode();
         request.put("serial", serial);
@@ -631,7 +644,7 @@ public class RestClient {
     public CertificateResult fetchPendingCertificate(String uuid) throws IOException, InterruptedException {
         LOG.info("Fetching pending certificate: {}", uuid);
         
-        String fetchUrl = baseUrl + "/ca/" + caName + "/fetch";
+        String fetchUrl = baseUrl + "/ca/" + encodePathSegment(caName) + "/fetch";
         
         ObjectNode request = MAPPER.createObjectNode();
         request.put("uuid", uuid);
