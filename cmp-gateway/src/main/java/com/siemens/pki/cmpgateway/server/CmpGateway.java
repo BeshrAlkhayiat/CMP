@@ -158,7 +158,9 @@ public final class CmpGateway {
             }
         }
 
-        private byte[] processCrmf(final PKIMessage request, final String certProfile) throws Exception {
+        private byte[] processCrmf(
+                final PKIMessage request, final String certProfile,
+                final PersistencyContext persistencyContext) throws Exception {
             CertReqMsg[] requests = CertReqMessages.getInstance(request.getBody().getContent())
                         .toCertReqMsgArray();
             if (requests.length != 1) {
@@ -174,7 +176,7 @@ public final class CmpGateway {
                     && !isCentralKeyGenerationRequest(template)) {
                 return issueCrmf(request, certReqMsg, certProfile);
             }
-            return generateCentralKey(request, certReqMsg);
+            return generateCentralKey(request, certReqMsg, persistencyContext);
         }
 
         private boolean isCentralKeyGenerationRequest(final CertTemplate template) {
@@ -200,8 +202,9 @@ public final class CmpGateway {
                             + "available CEMA REST API");
         }
 
-        private byte[] generateCentralKey(final PKIMessage request, final CertReqMsg certReqMsg)
-                throws Exception {
+        private byte[] generateCentralKey(
+                final PKIMessage request, final CertReqMsg certReqMsg,
+                final PersistencyContext persistencyContext) throws Exception {
             String commonName = null;
             final String transactionKey =
                     Base64.getEncoder().encodeToString(request.getHeader().getTransactionID().getOctets());
@@ -233,7 +236,10 @@ public final class CmpGateway {
             }
             generatedKeys.put(transactionKey, parsePrivateKey(result.privateKey));
             return certificateResponse(
-                    request, certReqMsg.getCertReq().getCertReqId().getValue(), certificate);
+                    request,
+                    persistencyContext,
+                    certReqMsg.getCertReq().getCertReqId().getValue(),
+                    certificate);
         }
 
         private PrivateKey parsePrivateKey(final byte[] encoded) throws Exception {
@@ -247,7 +253,9 @@ public final class CmpGateway {
             }
             throw new IOException("CEMA returned an unsupported private-key encoding", last);
         }
-        private byte[] issuePkcs10(final PKIMessage request, final String certProfile) throws Exception {
+        private byte[] issuePkcs10(
+                final PKIMessage request, final String certProfile,
+                final PersistencyContext persistencyContext) throws Exception {
             final CertificationRequest csr =
                     CertificationRequest.getInstance(request.getBody().getContent());
             // If no lookup is configured (or it is blank or the unused default), use the direct
@@ -257,7 +265,7 @@ public final class CmpGateway {
             final RestClient.CertificateResult result = useLookup
                     ? restClient.autoIssueCertificate(Base64.getEncoder().encodeToString(csr.getEncoded()))
                     : restClient.issueCertificate(Base64.getEncoder().encodeToString(csr.getEncoded()));
-            return certificateResponse(request, BigInteger.ZERO, awaitCertificate(result));
+            return certificateResponse(request, persistencyContext, BigInteger.ZERO, awaitCertificate(result));
         }
 
         private byte[] awaitCertificate(final RestClient.CertificateResult initial) throws Exception {
