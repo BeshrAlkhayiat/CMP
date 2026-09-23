@@ -66,7 +66,9 @@ public class Main {
             config.setRestBaseUrl(props.getProperty("rest.baseUrl", config.getRestBaseUrl()));
             config.setCaName(props.getProperty("ca.name", config.getCaName()));
             config.setTplName(props.getProperty("template.name", config.getTplName()));
-            config.setLookupName(props.getProperty("lookup.name", config.getLookupName()));
+            // Empty value disables auto-issue and selects the direct
+            // /ca/{caName}/template/{tplName}/issue endpoint.
+            config.setLookupName(props.getProperty("lookup.name", "").trim());
             config.setAuthType(props.getProperty("auth.type", config.getAuthType()));
             config.setUsername(props.getProperty("auth.username", config.getUsername()));
             config.setPassword(props.getProperty("auth.password", config.getPassword()));
