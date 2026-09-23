@@ -1,0 +1,46 @@
+---
+# Lower LRA close to EE
+
+DownstreamInterface:
+  HttpServer:
+    UpstreamURI:  "http://localhost:6006/delayedsupportlra"
+
+UpstreamInterface:
+  - OfflineFileClient:
+      inputDirectory: "./target/CmpTest/GenDownstream_GEN"
+      outputDirectory: "./target/CmpTest/GenUpstream_GEN"
+
+UpstreamConfiguration:
+  - VerificationContext:
+      trustedCertificates:
+        - "credentials/CMP_LRA_UPSTREAM_Root.pem"
+    reprotectMode: reprotect
+    outputCredentials:
+      Signature:
+        keyStore: "credentials/CMP_LRA_UPSTREAM_Keystore.p12"
+        Password: "Password"
+
+DownstreamConfiguration:
+  - VerificationContext:
+      trustedCertificates:
+        - "credentials/CMP_EE_Root.pem"
+    OutputCredentials:
+      Signature:
+        keyStore: "credentials/CMP_LRA_DOWNSTREAM_Keystore.p12"
+        Password: "Password"
+
+EnrollmentTrust:
+  - trustedCertificates:
+    - "credentials/ENROLL_Root.pem"
+
+RaVerifiedAcceptable:
+  - value: false
+
+ForceRaVerifyOnUpstream:
+  - value: false
+
+RetryAfterTimeInSeconds:
+  - value: 1
+  
+DownstreamTimeout:
+  - value: 100
