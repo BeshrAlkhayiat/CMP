@@ -274,10 +274,39 @@ public class TrustCredentialAdapter {
             // add "-Djava.security.debug=certpath" to the command line
             // to get more help, use "-Djava.security.debug=help" (really)
             //
+            // Without this log the caller only sees the generic
+            // "validating the protection certificate failed" warning; the root
+            // cause (e.g. "no trusted certificate found", name constraint or
+            // validity errors on a specific chain element) is lost here.
+            LOGGER.warn("PKIX path building failed for certificate '"
+                    + cert.getSubjectX500Principal() + "' issued by '"
+                    + cert.getIssuerX500Principal() + "': " + describeCertPathException(certExcpt)
+                    + " (for deeper analysis run with -Djava.security.debug=certpath)");
             return null;
         } catch (final InvalidAlgorithmParameterException | NoSuchAlgorithmException ex) {
             LOGGER.error("Exception while building certificate path:" + ex.getMessage());
             return null;
         }
+    }
+
+    /**
+     * Renders a {@link CertPathBuilderException} including its validator
+     * details (chain index and reason), which the JDK otherwise swallows.
+     */
+    private static String describeCertPathException(final CertPathBuilderException ex) {
+        final StringBuilder sb = new StringBuilder(String.valueOf(ex.getMessage()));
+        Throwable cause = ex.getCause();
+        while (cause != null) {
+            if (cause instanceof java.security.cert.CertPathValidatorException) {
+                final java.security.cert.CertPathValidatorException cpve =
+                        (java.security.cert.CertPathValidatorException) cause;
+                sb.append(" [at index ").append(cpve.getIndex()).append(": ")
+                        .append(cpve.getReason()).append("]");
+            } else {
+                sb.append(" [caused by: ").append(cause).append("]");
+            }
+            cause = cause.getCause();
+        }
+        return sb.toString();
     }
 }

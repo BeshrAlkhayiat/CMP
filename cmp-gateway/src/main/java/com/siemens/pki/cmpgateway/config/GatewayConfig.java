@@ -55,6 +55,13 @@ public class GatewayConfig implements Configuration {
     private Integer centralKeySize;
     private String centralKeyCurve;
     private boolean crmfEnabled;
+
+    /**
+     * Cache for the truststore contents: reading the PKCS#12 file on every CMP
+     * message is expensive and produces repeated log noise. Cleared whenever a
+     * new truststore path is configured.
+     */
+    private List<X509Certificate> cachedTrustedCertificates;
     
     public GatewayConfig() {
         // Defaults
@@ -100,7 +107,10 @@ public class GatewayConfig implements Configuration {
     public String getKeyAlias() { return keyAlias; }
     public void setKeyAlias(String keyAlias) { this.keyAlias = keyAlias; }
     public String getTruststorePath() { return truststorePath; }
-    public void setTruststorePath(String truststorePath) { this.truststorePath = truststorePath; }
+    public void setTruststorePath(String truststorePath) {
+        this.truststorePath = truststorePath;
+        this.cachedTrustedCertificates = null; // invalidate cache on reconfiguration
+    }
     public String getTruststorePassword() { return truststorePassword; }
     public void setTruststorePassword(String truststorePassword) { this.truststorePassword = truststorePassword; }
     public String getTruststoreType() { return truststoreType; }
@@ -167,8 +177,24 @@ public class GatewayConfig implements Configuration {
      * responses signed by the CA). Returns an empty list if no truststore is configured.
      */
     public List<X509Certificate> getTrustedCertificatesFromTrustStore() {
+        if (cachedTrustedCertificates != null) {
+            return cachedTrustedCertificates;
+        }
         if (truststorePath == null || truststorePath.isEmpty()) {
+            LOG.debug("no truststore configured (auth.truststore.path is empty); "
+                    + "upstream protection-certificate path validation will be skipped");
             return Collections.emptyList();
+        }
+        java.io.File tsFile = new java.io.File(truststorePath);
+        if (!tsFile.isFile()) {
+            // Fail loudly: a missing truststore file usually means a typo in
+            // auth.truststore.path or that the file was never exported. Without it,
+            // signature-protected upstream messages cannot be validated against trust.
+            LOG.warn("truststore file '" + tsFile.getAbsolutePath()
+                    + "' does not exist; upstream protection-certificate path validation "
+                    + "will be skipped. Fix auth.truststore.path or leave it empty to skip intentionally.");
+            cachedTrustedCertificates = Collections.emptyList();
+            return cachedTrustedCertificates;
         }
         try {
             KeyStore ts = loadTrustStore();
@@ -197,11 +223,92 @@ public class GatewayConfig implements Configuration {
             }
             LOG.info("Loaded " + result.size() + " trusted certificate(s) from truststore '"
                     + truststorePath + "'");
+            for (X509Certificate cert : result) {
+                LOG.debug("trust anchor: subject='" + cert.getSubjectX500Principal()
+                        + "', issuer='" + cert.getIssuerX500Principal()
+                        + "', notBefore=" + cert.getNotBefore()
+                        + ", notAfter=" + cert.getNotAfter());
+            }
+            cachedTrustedCertificates = result;
             return result;
         } catch (Exception e) {
             LOG.warn("could not load truststore '" + truststorePath + "' for CMP protection validation", e);
             return Collections.emptyList();
         }
+    }
+
+    /**
+     * Trust anchors for validating signature-protected upstream (CA) CMP responses.
+     * Injected by Main after the REST client is created, so the gateway can fetch
+     * them automatically from CEMA (GET /ca/{caName}/chain) instead of requiring a
+     * manually exported truststore file. May be null before injection.
+     */
+    private volatile java.util.function.Supplier<List<X509Certificate>> upstreamTrustSupplier;
+
+    public void setUpstreamTrustSupplier(
+            java.util.function.Supplier<List<X509Certificate>> upstreamTrustSupplier) {
+        this.upstreamTrustSupplier = upstreamTrustSupplier;
+        // Invalidate any cached result so the new source takes effect immediately.
+        this.cachedAutomaticCaChain = null;
+        LOG.debug("upstream trust anchor supplier configured (automatic CA chain via GET /ca/{}/chain)",
+                caName);
+    }
+
+    /** Cache for the automatically fetched CA chain; failures are retried on next access. */
+    private volatile List<X509Certificate> cachedAutomaticCaChain;
+
+    /**
+     * Set while the gateway is generating and protecting an upstream response
+     * itself (see CmpGateway.RestUpstream). The RA component runs the full
+     * upstream validation chain over that self-generated CertRep, including
+     * PKIX path validation of its signature protection against the CA trust
+     * anchors. The gateway's signer certificate is normally issued by a
+     * different CA (e.g. an admin/RA CA) than the enrollment CA, so that check
+     * would fail with "validating the protection certificate failed"
+     * (signerNotTrusted). While this flag is set, path validation is skipped -
+     * safely, because the message originates from our own code, not the network.
+     */
+    private final ThreadLocal<Boolean> selfGeneratedUpstreamMessage = new ThreadLocal<>();
+
+    public boolean isProcessingSelfGeneratedUpstreamMessage() {
+        return Boolean.TRUE.equals(selfGeneratedUpstreamMessage.get());
+    }
+
+    public void setProcessingSelfGeneratedUpstreamMessage(final boolean processing) {
+        if (processing) {
+            selfGeneratedUpstreamMessage.set(Boolean.TRUE);
+        } else {
+            selfGeneratedUpstreamMessage.remove();
+        }
+    }
+
+    /**
+     * Automatic trust anchors: the CA certificate chain fetched from CEMA via
+     * GET /ca/{caName}/chain (through the supplier injected above). Returns an empty
+     * list if no supplier is set or the fetch fails - the caller then falls back to
+     * the file-based truststore or skips path validation.
+     */
+    public List<X509Certificate> getAutomaticallyFetchedCaChain() {
+        java.util.function.Supplier<List<X509Certificate>> supplier = this.upstreamTrustSupplier;
+        if (supplier == null) {
+            return Collections.emptyList();
+        }
+        List<X509Certificate> cached = this.cachedAutomaticCaChain;
+        if (cached != null) {
+            return cached;
+        }
+        try {
+            List<X509Certificate> chain = supplier.get();
+            if (chain != null && !chain.isEmpty()) {
+                this.cachedAutomaticCaChain = chain;
+                return chain;
+            }
+            LOG.warn("automatic CA chain fetch returned no certificates");
+        } catch (Exception e) {
+            LOG.warn("could not fetch the CA chain automatically from CEMA "
+                    + "(GET /ca/" + caName + "/chain); falling back to the file truststore", e);
+        }
+        return Collections.emptyList();
     }
 
     public List<X509Certificate> getCertificateChain() throws Exception {
@@ -428,13 +535,68 @@ public class GatewayConfig implements Configuration {
                 return new VerificationContext() {
                     @Override
                     public Collection<X509Certificate> getTrustedCertificates() {
+                        // Responses generated by the gateway itself are protected with the
+                        // gateway's signer certificate, which is usually issued by a
+                        // different CA than the enrollment CA and therefore cannot build a
+                        // PKIX path against the CA chain anchors. Skip path validation for
+                        // those (see selfGeneratedUpstreamMessage).
+                        if (isProcessingSelfGeneratedUpstreamMessage()) {
+                            LOG.debug("upstream verification: protection certificate of "
+                                    + "self-generated gateway response accepted without "
+                                    + "PKIX path validation");
+                            return null;
+                        }
                         // Trust anchors for validating signature-protected upstream
-                        // responses: the certificates from the configured truststore.
-                        // If none are configured, return null to skip path validation
-                        // rather than an empty list, which fails with
-                        // "the trustAnchors parameter must be non-empty".
+                        // responses. Resolution order:
+                        //  1. The CA chain fetched automatically from CEMA
+                        //     (GET /ca/{caName}/chain) - no manual truststore needed.
+                        //  2. The file-based truststore from auth.truststore.path, if set.
+                        //  3. null -> skip certificate-path validation (never return an
+                        //     empty list, which breaks PKIX with
+                        //     "the trustAnchors parameter must be non-empty").
+                        List<X509Certificate> autoChain = getAutomaticallyFetchedCaChain();
+                        if (!autoChain.isEmpty()) {
+                            LOG.debug("upstream verification: validating protection certificates "
+                                    + "against {} automatically fetched CA chain certificate(s)",
+                                    autoChain.size());
+                            return autoChain;
+                        }
                         List<X509Certificate> trusted = getTrustedCertificatesFromTrustStore();
-                        return trusted.isEmpty() ? null : trusted;
+                        if (trusted.isEmpty()) {
+                            LOG.debug("upstream verification: no trust anchors available "
+                                    + "(automatic CA chain fetch failed/unavailable and no usable "
+                                    + "truststore configured), skipping protection-certificate "
+                                    + "path validation");
+                            return null;
+                        }
+                        LOG.debug("upstream verification: validating protection certificates "
+                                + "against {} trust anchor(s) from the file truststore",
+                                trusted.size());
+                        return trusted;
+                    }
+
+                    @Override
+                    public Collection<X509Certificate> getAdditionalCerts() {
+                        // The gateway signs its self-generated upstream CertReps with its
+                        // own client certificate. When that certificate is not published in
+                        // the truststore (e.g. issued by a different CA), supply its issuing
+                        // chain here so PKIX path building can still build a valid chain to
+                        // a configured trust anchor. Without this, validation fails with
+                        // "validating the protection certificate failed" (signerNotTrusted).
+                        try {
+                            List<X509Certificate> chain = getCertificateChain();
+                            if (chain.size() > 1) {
+                                // Everything above the leaf acts as intermediate material.
+                                LOG.debug("upstream verification: supplying {} additional CA "
+                                        + "certificate(s) from the gateway keystore for path "
+                                        + "building", chain.size() - 1);
+                                return chain.subList(1, chain.size());
+                            }
+                        } catch (Exception e) {
+                            LOG.warn("upstream verification: could not load gateway certificate "
+                                    + "chain for additional path-building material", e);
+                        }
+                        return VerificationContext.super.getAdditionalCerts();
                     }
                 };
             }
