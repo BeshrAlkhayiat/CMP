@@ -1,4 +1,5 @@
 # Build artifacts
 build/
-cmp-gateway/build/
-cmp-gateway/.gradle/
+
+cmp-gateway/.gradle
+cmp-gateway/build
