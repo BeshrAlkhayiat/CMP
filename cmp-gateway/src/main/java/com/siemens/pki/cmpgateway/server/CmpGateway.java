@@ -251,6 +251,19 @@ public final class CmpGateway {
                         return processCrmf(message, certProfile, persistencyContext);
                     case PKIBody.TYPE_GEN_MSG:
                         return handleGeneralMessage(message, certProfile, persistencyContext);
+                    case 24: // RevNotify (post-confirmation revocation notice)
+                    case 25: // CcrNotify
+                    case 26: // KuNotify
+                        // Post-confirmation notify messages (RFC 4210 5.3.27-29).
+                        // OpenSSL's CMP client sends revocationNotice (body type 24,
+                        // RevNotify) after CERTCONF; LCMP has no CEMA backend endpoint
+                        // for these notifications. Acknowledge with an empty RevRep
+                        // instead of letting the switch fall through to an exception
+                        // (which surfaced to the client as systemFailure / "exception
+                        // processing request at upstream interface").
+                        LOG.info("acknowledging post-confirmation notify message,"
+                                + " body type {} (no CEMA backend action)", bodyType);
+                        return new byte[] {0x30, 0x03, 0x0A, 0x01, 0x00}; // SEQUENCE { ENUM 0 = accepted }
                     default:
                         throw new UnsupportedOperationException(
                                 "LCMP body type " + bodyType + " is not mapped to CEMA");
