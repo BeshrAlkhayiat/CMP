@@ -112,3 +112,31 @@ if the transaction completes, §2/§5 are confirmed as the sole blocker.
   (`SignatureProtectionValidator`, `TrustCredentialAdapter`, `CmpRaUpstream`).
 - Workspace HEAD `5822210` contains the echo/re-sign attempt; it compiles
   (`javac` clean) but is analytically unsound for CA-issued EE certs (§2 step 3/5).
+
+## Update (run 13:10): smoking gun confirmed + fixed
+
+New logging proved the diagnosis: `upstream trust anchor query #1: self-generated response in progress=false`
+while validating our own CertRep on the same thread. Cause: the RA component
+(CmpRaUpstream.handleRequest, verified in sources jar) runs InputValidator on the message
+**after** the upstream exchange callback returned - our finally-block had already cleared the
+ThreadLocal flag, so the gateway keystore chain was never merged into the trust anchors and
+PKIX failed against CEMA-only anchors.
+
+Fix: replaced the ThreadLocal with a plain volatile field in GatewayConfig; the flag is no
+longer cleared inside RestUpstream.sendReceiveMessage's finally block but once per downstream
+request in CmpHandler.handle (finally around cmpRaInterface.processRequest). Compiles clean.
+
+Expected next run log: "self-generated response in progress=true", "merging gateway keystore
+chain ... [CN=CEMA Admin..., CN=BoarderZone Dev CA...]", anchors include BoarderZone Dev CA,
+and validation passes. If instead the keystore chain shows only the CEMA Admin leaf, add
+BoarderZone Dev CA to auth.truststore.path.
+
+## Update after run with logging (2026-09-25)
+
+Log analysis:
+- Request protection = signature (sha256RSA), sender = CN=CEMA Admin -> LCMP is signing with the SAME cert as the REST auth identity.
+- Gateway response signed with that cert, but trust anchor query showed "in progress=false" and only 2 anchors (CEMA User CA + Root CA). The keystore-chain merge was skipped.
+- Cause A (fixed): user's running build predates the volatile-flag change; flag now set only for signature-protected requests and cleared in CmpHandler.handle after processRequest returns.
+- Cause B (fixed): getCertificateChain() returned EMPTY if auth.keystore.alias does not match the p12 key entry or if the entry stores only the leaf (typical Tomcat-exported p12). Now: alias falls back to the first key entry; leaf-only entries get their issuing chain rebuilt from other keystore entries; loud WARNs otherwise.
+
+Remaining hard requirement: PKIX needs a path from the gateway signer cert to an anchor. If the p12/keystore contains ONLY the Tomcat leaf, the BoarderZone Dev CA must be added to auth.truststore.path - the new WARN log says exactly this. Long-term correct design (per user): CMP signer should be a cert under the CEMA PKI (same chain the API returns via GET /ca/CEMA-User-CA/chain); the Tomcat cert is for REST/TLS auth only.

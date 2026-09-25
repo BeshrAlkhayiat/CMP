@@ -207,7 +207,21 @@ public final class CmpGateway {
             // tell GatewayConfig to add the gateway keystore chain as extra trust anchor
             // (see selfGeneratedUpstreamMessage) and override senderKID accordingly in
             // protectUpstreamResponse().
-            config.setProcessingSelfGeneratedUpstreamMessage(true);
+            // IMPORTANT: the flag must NOT be cleared in this callback's finally
+            // block - the RA validates the returned message AFTER this method has
+            // already completed (observed live: trust anchor query with
+            // "in progress=false" during validation of our own CertRep). The
+            // volatile flag stays set until the whole downstream request finished;
+            // it is cleared in CmpHandler.handle below.
+            if (isSignatureProtectedRequest(message)) {
+                // Only signature-protected EE requests lead to a self-generated,
+                // signature-protected CertRep (see protectUpstreamResponse). PBM
+                // answers reuse the request's MAC credentials and never touch the
+                // PKIX anchor path - keep the merge off for them so the gateway's
+                // REST-auth (Tomcat) certificate can never become a CMP trust
+                // anchor outside this narrow case.
+                config.setProcessingSelfGeneratedUpstreamMessage(true);
+            }
             try {
                 switch (bodyType) {
                     case PKIBody.TYPE_P10_CERT_REQ:
@@ -235,7 +249,10 @@ public final class CmpGateway {
                                 "LCMP body type " + bodyType + " is not mapped to CEMA");
                 }
             } finally {
-                config.setProcessingSelfGeneratedUpstreamMessage(false);
+                // NOTE: the self-generated-upstream flag is deliberately NOT cleared
+                // here - the RA component validates the message returned from this
+                // callback only afterwards (see comment above). It is cleared once per
+                // downstream request in handleDownstreamRequest().
                 currentTransaction.remove();
             }
         }
@@ -881,7 +898,17 @@ public final class CmpGateway {
                     exchange.sendResponseHeaders(405, -1);
                     return;
                 }
-                final byte[] response = cmpRaInterface.processRequest(exchange.getRequestBody().readAllBytes());
+                // The RA component may set (via our upstream exchange callback) the
+                // "self-generated upstream message" flag in GatewayConfig to merge the
+                // gateway keystore chain into the upstream trust anchors. That flag is
+                // intentionally kept until validation finished - clear it here, once
+                // per downstream request, after processRequest returned/failed.
+                final byte[] response;
+                try {
+                    response = cmpRaInterface.processRequest(exchange.getRequestBody().readAllBytes());
+                } finally {
+                    config.setProcessingSelfGeneratedUpstreamMessage(false);
+                }
                 if (response == null) {
                     exchange.sendResponseHeaders(204, -1);
                     return;

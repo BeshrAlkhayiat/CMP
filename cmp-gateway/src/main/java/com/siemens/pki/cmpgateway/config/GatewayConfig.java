@@ -266,24 +266,30 @@ public class GatewayConfig implements Configuration {
      * anchors. The gateway's signer certificate is normally issued by a
      * different CA (e.g. an admin/RA CA) than the enrollment CA, so that check
      * would fail with "validating the protection certificate failed"
-     * (signerNotTrusted). While this flag is set, path validation is skipped -
-     * safely, because the message originates from our own code, not the network.
+     * (signerNotTrusted). While this flag is set, the gateway keystore chain is
+     * merged into the upstream trust anchors - safely, because the validated
+     * message originates from our own code, not the network.
+     *
+     * NOTE: deliberately NOT a ThreadLocal. The RA component re-validates the
+     * message returned from the upstream exchange callback AFTER that callback
+     * has already completed and its finally-block cleared the flag (observed
+     * live as "self-generated response in progress=false" while validating a
+     * self-generated CertRep on the same thread pool-1-thread-1). A plain
+     * volatile field stays visible for the whole request handling; it is set
+     * when the gateway builds a response itself and cleared only after the RA
+     * finished validating it (see CmpGateway.sendReceiveMessage wrapper).
      */
-    private final ThreadLocal<Boolean> selfGeneratedUpstreamMessage = new ThreadLocal<>();
+    private volatile boolean selfGeneratedUpstreamMessage;
 
     /** Count of validation queries for diagnosing flag/thread mismatches. */
     private int trustedCertsQueries;
 
     public boolean isProcessingSelfGeneratedUpstreamMessage() {
-        return Boolean.TRUE.equals(selfGeneratedUpstreamMessage.get());
+        return selfGeneratedUpstreamMessage;
     }
 
     public void setProcessingSelfGeneratedUpstreamMessage(final boolean processing) {
-        if (processing) {
-            selfGeneratedUpstreamMessage.set(Boolean.TRUE);
-        } else {
-            selfGeneratedUpstreamMessage.remove();
-        }
+        this.selfGeneratedUpstreamMessage = processing;
     }
 
     /**
@@ -320,8 +326,44 @@ public class GatewayConfig implements Configuration {
         if (ks == null) {
             return Collections.emptyList();
         }
-        java.security.cert.Certificate[] certs = ks.getCertificateChain(keyAlias);
-        if (certs == null) {
+        String alias = keyAlias;
+        if (alias == null || alias.isEmpty() || !ks.containsAlias(alias)) {
+            // No (or a non-matching) auth.keystore.alias configured: pick the first
+            // key entry in the keystore instead of failing silently.
+            java.util.Enumeration<String> aliases = ks.aliases();
+            while (aliases.hasMoreElements()) {
+                String candidate = aliases.nextElement();
+                if (ks.isKeyEntry(candidate)) {
+                    if (alias != null && !alias.isEmpty()) {
+                        LOG.warn("configured keystore alias '{}' not found; using key entry '{}'",
+                                alias, candidate);
+                    }
+                    alias = candidate;
+                    break;
+                }
+            }
+        }
+        java.security.cert.Certificate[] certs =
+                alias == null ? null : ks.getCertificateChain(alias);
+        if (certs == null || certs.length == 0) {
+            // The configured key entry stores only the leaf certificate (typical
+            // when a PKCS#12 was exported from a keystore without its issuing CA,
+            // e.g. the gateway's REST-auth/Tomcat certificate). Without the
+            // issuing chain, PKIX path building against this certificate can
+            // never succeed. Fall back to any certificate in the keystore whose
+            // subject matches the leaf's ISSUER DN - usually the issuing CA
+            // stored under its own alias in the same p12 file.
+            LOG.warn("keystore entry '{}' has no stored certificate chain beyond"
+                            + " the leaf; searching the keystore for the issuing CA",
+                    alias);
+            List<X509Certificate> rebuilt = rebuildChainFromKeystoreEntries(ks, certs);
+            if (rebuilt != null) {
+                return rebuilt;
+            }
+            LOG.warn("issuing CA of the gateway signer certificate not found in"
+                    + " the keystore; signature-protected CMP responses signed"
+                    + " with it cannot be validated unless the issuing CA is"
+                    + " present in auth.truststore.path");
             return Collections.emptyList();
         }
         List<X509Certificate> result = new java.util.ArrayList<>();
@@ -331,6 +373,61 @@ public class GatewayConfig implements Configuration {
             }
         }
         return result;
+    }
+
+    /**
+     * Best-effort chain reconstruction: take the leaf (first element of
+     * {@code stored}, may be null/empty) and append every keystore certificate
+     * whose SUBJECT equals an issuer DN already contained in the partial chain,
+     * until nothing matches anymore. Returns the leaf-only list if there is no
+     * leaf, or null if no chain beyond the leaf could be built.
+     */
+    private List<X509Certificate> rebuildChainFromKeystoreEntries(
+            final KeyStore ks, final java.security.cert.Certificate[] stored) throws Exception {
+        List<X509Certificate> chain = new java.util.ArrayList<>();
+        if (stored != null && stored.length > 0 && stored[0] instanceof X509Certificate) {
+            chain.add((X509Certificate) stored[0]);
+        } else {
+            // Not even a leaf on the key alias - pick the single key entry's cert.
+            java.util.Enumeration<String> aliases = ks.aliases();
+            while (chain.isEmpty() && aliases.hasMoreElements()) {
+                String a = aliases.nextElement();
+                if (ks.isKeyEntry(a)) {
+                    java.security.cert.Certificate c = ks.getCertificate(a);
+                    if (c instanceof X509Certificate) {
+                        chain.add((X509Certificate) c);
+                    }
+                }
+            }
+        }
+        if (chain.isEmpty()) {
+            return null;
+        }
+        boolean extended = true;
+        while (extended) {
+            extended = false;
+            String neededIssuer = chain.get(chain.size() - 1).getIssuerX500Principal().getName();
+            if (neededIssuer.equals(chain.get(chain.size() - 1).getSubjectX500Principal().getName())) {
+                break; // self-signed root reached
+            }
+            java.util.Enumeration<String> aliases = ks.aliases();
+            while (aliases.hasMoreElements()) {
+                String a = aliases.nextElement();
+                java.security.cert.Certificate c = ks.getCertificate(a);
+                if (c instanceof X509Certificate) {
+                    X509Certificate xc = (X509Certificate) c;
+                    if (!chain.contains(xc)
+                            && xc.getSubjectX500Principal().getName().equals(neededIssuer)) {
+                        chain.add(xc);
+                        extended = true;
+                        LOG.info("found issuing CA '{}' in keystore entry '{}'; appended to"
+                                + " the gateway certificate chain", xc.getSubjectX500Principal(), a);
+                        break;
+                    }
+                }
+            }
+        }
+        return chain.size() > 1 ? chain : null;
     }
     
     public PrivateKey getPrivateKey() throws Exception {
