@@ -63,6 +63,7 @@ import org.bouncycastle.asn1.cmp.CertOrEncCert;
 import org.bouncycastle.asn1.cmp.CertRepMessage;
 import org.bouncycastle.asn1.cmp.CertResponse;
 import org.bouncycastle.asn1.cmp.GenMsgContent;
+import org.bouncycastle.asn1.cmp.PKIConfirmContent;
 import org.bouncycastle.asn1.DERBitString;
 import org.bouncycastle.asn1.cmp.GenRepContent;
 import org.bouncycastle.asn1.cmp.InfoTypeAndValue;
@@ -251,19 +252,45 @@ public final class CmpGateway {
                         return processCrmf(message, certProfile, persistencyContext);
                     case PKIBody.TYPE_GEN_MSG:
                         return handleGeneralMessage(message, certProfile, persistencyContext);
-                    case 24: // RevNotify (post-confirmation revocation notice)
-                    case 25: // CcrNotify
-                    case 26: // KuNotify
-                        // Post-confirmation notify messages (RFC 4210 5.3.27-29).
-                        // OpenSSL's CMP client sends revocationNotice (body type 24,
-                        // RevNotify) after CERTCONF; LCMP has no CEMA backend endpoint
-                        // for these notifications. Acknowledge with an empty RevRep
-                        // instead of letting the switch fall through to an exception
-                        // (which surfaced to the client as systemFailure / "exception
-                        // processing request at upstream interface").
-                        LOG.info("acknowledging post-confirmation notify message,"
+                    case PKIBody.TYPE_CERT_CONFIRM:
+                        // CertConfirm (PKIConf, RFC 4210 5.3.23 / 5.3.15): OpenSSL's
+                        // CMP client sends this after receiving the CP to confirm
+                        // acceptance of the issued certificate. The CEMA REST backend
+                        // has already delivered the certificate in the CP, so there is
+                        // nothing to forward - acknowledge locally with a PkiAcceptConf
+                        // (PKIBody.TYPE_CONFIRM carrying an empty PKIConfirmContent),
+                        // protected like every other self-generated upstream response.
+                        // Without this case the switch fell through and the RA retried
+                        // the stored P10CR request body against issuePkcs10(), which hit
+                        // CertificationRequest.getInstance() on a DEROctetString and
+                        // surfaced to the client as
+                        // "systemFailure ... exception processing request at upstream
+                        // interface for first bodyType 4".
+                        LOG.info("acknowledging CertConfirm (body type {}) with"
+                                + " PkiAcceptConf (no CEMA backend action)", bodyType);
+                        return protectUpstreamResponse(
+                                message,
+                                persistencyContext,
+                                new PKIBody(PKIBody.TYPE_CONFIRM, new PKIConfirmContent()))
+                                        .getEncoded();
+                    case PKIBody.TYPE_REVOCATION_ANN: // RevAnnounce (RFC 4210 5.3.27)
+                    case PKIBody.TYPE_CRL_ANN:        // CrlOutBoundNewest (5.3.28)
+                    case PKIBody.TYPE_CONFIRM:        // PkiAcceptConf (5.3.15/5.3.29)
+                        // Post-confirmation announce/notify messages. LCMP has no CEMA
+                        // backend endpoint for these; acknowledge with an empty granted
+                        // RevRep (RFC 4210 5.3.26). The RA component maps RevAnnounce
+                        // and CrlAnnounce responses to RevRep bodies; PkiAcceptConf
+                        // replies are ignored downstream but must still be returned.
+                        LOG.info("acknowledging post-confirmation announce/notify message,"
                                 + " body type {} (no CEMA backend action)", bodyType);
-                        return new byte[] {0x30, 0x03, 0x0A, 0x01, 0x00}; // SEQUENCE { ENUM 0 = accepted }
+                        return protectUpstreamResponse(
+                                message,
+                                persistencyContext,
+                                new PKIBody(
+                                        PKIBody.TYPE_REVOCATION_REP,
+                                        new RevRepContentBuilder().add(
+                                                new PKIStatusInfo(PKIStatus.granted)).build()))
+                                        .getEncoded();
                     default:
                         throw new UnsupportedOperationException(
                                 "LCMP body type " + bodyType + " is not mapped to CEMA");
