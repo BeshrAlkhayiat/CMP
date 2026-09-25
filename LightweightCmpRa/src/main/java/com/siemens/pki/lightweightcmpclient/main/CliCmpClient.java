@@ -43,7 +43,6 @@ import java.security.cert.X509Certificate;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.Date;
-import java.util.ArrayList;
 import java.util.List;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
@@ -257,24 +256,7 @@ public class CliCmpClient {
                 CredentialWriter.writePrivateKey(privateKey, out);
             }
         }
-        // NOTE: the enrolled certificate itself must always be part of the
-        // keystore chain - KeyStore.setKeyEntry rejects a null/empty chain
-        // (java.lang.NullPointerException: Cannot read the array length because "certs" is null).
-        // getEnrollmentChain() only contains intermediates/root and is null when no
-        // enrollment trust anchors are configured, so build the full chain here.
-        List<X509Certificate> enrollmentChain = ret.getEnrollmentChain();
-        final X509Certificate enrolledForKeystore = ret.getEnrolledCertificate();
-        final List<X509Certificate> fullChain = new ArrayList<>();
-        if (enrolledForKeystore != null) {
-            fullChain.add(enrolledForKeystore);
-        }
-        if (enrollmentChain != null) {
-            for (final X509Certificate intermediate : enrollmentChain) {
-                if (!intermediate.equals(enrolledForKeystore)) {
-                    fullChain.add(intermediate);
-                }
-            }
-        }
+        final List<X509Certificate> enrollmentChain = ret.getEnrollmentChain();
         if (cmd.hasOption(OPTION_enrollmentChain) && enrollmentChain != null && !enrollmentChain.isEmpty()) {
             try (OutputStream out = new FileOutputStream(cmd.getOptionValue(OPTION_enrollmentChain))) {
                 for (final X509Certificate cert : enrollmentChain) {
@@ -289,12 +271,11 @@ public class CliCmpClient {
                         + OPTION_enrollmentKeystorePassword.getLongOpt() + " given, won't write keystore");
             } else if (enrolledPrivateKey == null) {
                 System.err.println("no private key accessible, won't write keystore");
-            } else if (fullChain.isEmpty()) {
-                System.err.println("no certificate to store, won't write keystore");
             } else {
                 try (OutputStream out = new FileOutputStream(cmd.getOptionValue(OPTION_enrollmentKeystore))) {
+                    final List<X509Certificate> chainAndCert = ret.getEnrollmentChain();
                     CredentialWriter.writeKeystore(
-                            fullChain.toArray(new X509Certificate[0]),
+                            chainAndCert.toArray(new X509Certificate[chainAndCert.size()]),
                             enrolledPrivateKey,
                             cmd.getOptionValue(OPTION_enrollmentKeystorePassword)
                                     .toCharArray(),
