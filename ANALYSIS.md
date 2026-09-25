@@ -1,0 +1,114 @@
+# CMP Gateway — Root-Cause Analysis: "validating the protection certificate failed"
+
+Status: **analysis only, no code changed** (per request). All findings below are
+verified against actual source in this repo and the `cmp-ra-component` sources jar,
+not guessed.
+
+## 1. Symptom
+
+```
+RestClient - Fetched 2 CA certificate(s) from 'GET /ca/CEMA-User-CA/chain'   (User CA + Root CA)
+WARN SignatureProtectionValidator - validating the protection certificate failed
+WARN BaseCmpException - error at CMP upstream: validating the protection certificate failed
+```
+LCMP client (`gateway-p10-pbm.yaml`) then receives `ERROR`.
+
+## 2. Exact failure chain (verified)
+
+1. The EE request is **signature-protected** (the PBM config file is a red herring;
+   see §4). It reaches the RA component downstream side, is validated OK, and is
+   forwarded to the gateway's `UpstreamExchange.sendReceiveMessage()` callback.
+2. `RestUpstream.issuePkcs10()` calls CEMA REST, gets the issued cert, builds a
+   CertRep body and hands it to `protectUpstreamResponse()`
+   (`CmpGateway.java:571`).
+3. For signature-protected requests the current code takes the branch at
+   `CmpGateway.java:615-623`: `buildEchoedExtraCertsInterface()` makes
+   `MsgOutputProtector` embed **the EE's own signer certificate as extraCerts[0]**
+   of the generated CertRep and sign with the **gateway keystore key**.
+   Then `reSignWithClientKey()` (`CmpGateway.java:813`) looks for a private key in
+   `ClientAuthCert-CEMA-Admin.p12` matching the EE signer. The LCMP test client's
+   key is **not** in that keystore → warning "cannot re-sign ... no matching private
+   key found" → response returned signed by the *gateway* key but carrying the
+   *EE* cert in extraCerts[0].
+4. Back inside the RA component, `CmpRaUpstream.handleRequest()`
+   (sources jar, line ~203) runs `InputValidator` over **whatever the callback
+   returns**, using `config.getUpstreamConfiguration()` — i.e.
+   `GatewayConfig.getUpstreamConfiguration().getInputVerification()`.
+5. `SignatureProtectionValidator.validate()` (RA sources):
+   - picks `extraCerts[0]` (= the echoed EE cert) as protecting cert,
+   - `checkProtectingSignature()`: verifies the DER signature with that cert's
+     public key → **passes only because the echoed cert happens to be self-signed
+     and its subject == header.sender** (CN=…test cert…). With a CA-issued EE cert
+     or an embedded chain this check itself would fail with "signature broken".
+   - `validateCertAgainstTrust(EE-cert, [EE-cert])` → PKIX path building against
+     the trust anchors returned by `getTrustedCertificates()`.
+6. Trust anchors = the auto-fetched **CEMA User CA / CEMA Root CA chain**
+   (logged right before the warning). The EE's enrollment credential cannot build a
+   PKIX path to those anchors (it is not yet issued / different PKI), so
+   `CertPathBuilder` fails → `null` → **"validating the protection certificate
+   failed"** → `PKIFailureInfo.signerNotTrusted` → ERROR to the client.
+
+## 3. Why the existing ThreadLocal workaround does NOT help
+
+`GatewayConfig.getUpstreamConfiguration().getInputVerification()
+.getTrustedCertificates()` (`GatewayConfig.java:537-548`) *does* return `null`
+(skip validation) while `isProcessingSelfGeneratedUpstreamMessage()` is set
+(`CmpGateway.java:195`). Two problems:
+
+- **RA version behavior:** in `TrustCredentialAdapter.validateCertAgainstTrust`
+  (line ~124-127 of the RA sources) `trustedCertificates == null` ⇒ `return null`
+  ⇒ which `SignatureProtectionValidator` treats as **failure**, not skip. So even
+  when the flag works, this RA build rejects. (The comment in GatewayConfig says
+  "null disables validation" — that holds on the *downstream* path via
+  `ProtectionValidator`, but the upstream validator here maps null→fail.)
+- **Thread-boundary risk:** the flag is a plain `ThreadLocal` on the gateway
+  config. It only helps if validation happens on the same thread that ran the
+  callback. Any delayed/poll path or executor hop clears/bypasses it.
+
+## 4. Client-side observation (why "PBM" config still sends signatures)
+
+`gateway-p10-pbm.yaml` supplies `SharedSecret` in both verification and output
+credentials, but LCMP's `CmpClientComponent` prefers signature-based protection
+whenever the client context yields a usable signer (self-signed test cert from the
+shared LCMP test credentials). Hence `isSignatureProtectedRequest()==true` on the
+gateway. To actually exercise the PBM path, the client must have **no** signer
+credential configured (only the shared secret).
+
+## 5. Design flaw summary
+
+A real CMP server answers a signature-protected request with a message signed by
+**its own** protected-cert (which the client trusts). This gateway has no CA-issued
+CMP signer: its identity (`CN=CEMA Admin`, issuer `BoarderZone Dev CA`) belongs to
+a different PKI than the enrollment anchors (`CEMA User CA/Root CA`). Both current
+strategies therefore fail the mandatory upstream trust check:
+- sign with gateway cert → path to BoarderZone Dev CA ≠ anchors → fail (original bug);
+- echo EE cert (current fix attempt) → signature bytes don't verify against it
+  unless the gateway holds the EE key → either "signature broken" or the observed
+  trust-path failure.
+
+## 6. Viable options (NOT implemented — decision needed)
+
+| # | Option | Effort | Notes |
+|---|--------|--------|-------|
+| A | Make the client really use **PBM/PBMAC1** (remove signer from LCMP config) | trivial | The mirrored-PBM branch (`buildReusedCredentialContext`) already works; `PasswordBasedMacValidator` needs no cert trust. Recommended for testing. |
+| B | Sign upstream responses with a cert **under the CEMA chain**: obtain e.g. a "CEMA User CA"-issued gateway cert, put it in `auth.keystore.path` | small | Correct long-term design; matches how real CMP servers work. |
+| C | Merge the BoarderZone/gateway-chain into upstream trust anchors (`getAutomaticallyFetchedCaChain()` ∪ `auth.truststore.path` contents) and revert to gateway-cert signing | small | Weakens upstream trust model (any BoarderZone-issued signer accepted). |
+| D | Fix the ThreadLocal hack properly: extend `getTrustedCertificates()` skip to also trigger when the validating cert equals the gateway leaf **and** make the RA treat null as skip — requires patching `cmp-ra-component` (vendored here) | medium | Touches third-party code. |
+| E | Keep echo approach but only when the gateway actually holds the echoed cert's key (i.e., restrict to self-signed-LCMP-with-imported-key scenarios) | small | Doesn't solve production case. |
+
+## 7. How to confirm quickly (runtime experiment, no code change)
+
+Run the LCMP client with a **pure PBM config** (delete any `Signer`/keystore
+section so only `SharedSecret` remains) against the *current* gateway build:
+if the transaction completes, §2/§5 are confirmed as the sole blocker.
+
+## 8. Environment facts used
+
+- `cmp-gateway/gateway.properties`: `auth.keystore.path=ClientAuthCert-CEMA-Admin.p12`
+  (leaf `CN=CEMA Admin` ← `CN=BoarderZone Dev CA`), `ca.name=CEMA-User-CA`,
+  truststore unset ⇒ anchors come from `GET /ca/CEMA-User-CA/chain`.
+- RA component 4.3.0 sources extracted from
+  `cmp-ra-component/target/CmpRaComponent-4.3.0-sources.jar`
+  (`SignatureProtectionValidator`, `TrustCredentialAdapter`, `CmpRaUpstream`).
+- Workspace HEAD `5822210` contains the echo/re-sign attempt; it compiles
+  (`javac` clean) but is analytically unsound for CA-issued EE certs (§2 step 3/5).
