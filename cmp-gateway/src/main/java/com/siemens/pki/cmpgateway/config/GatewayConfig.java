@@ -584,6 +584,16 @@ public class GatewayConfig implements Configuration {
         return downstreamTimeoutSeconds;
     }
     
+    /**
+     * True if the certificate is self-signed (subject DN == issuer DN), i.e. a
+     * potential PKIX trust anchor. Cross-signed certificates that happen to
+     * share subject and issuer DNs but differ in the public key are still
+     * treated as roots here - they can legitimately anchor a path.
+     */
+    private static boolean isSelfSigned(final X509Certificate cert) {
+        return cert.getSubjectX500Principal().equals(cert.getIssuerX500Principal());
+    }
+
     @Override
     public VerificationContext getEnrollmentTrust(String certProfile, int bodyType) {
         // Trust context for validating the ISSUED end-entity certificate.
@@ -592,29 +602,68 @@ public class GatewayConfig implements Configuration {
         // and aborts with "could not validate trust chain of issued certificate"
         // if that returns null/empty - which it did when we returned null here
         // (in this RA version null anchors are a hard failure, not a skip).
-        // Correct behaviour for a gateway: trust exactly the issuing CA(s) of the
-        // CMP template in use - the chain fetched from CEMA via GET /ca/{caName}/chain.
+        //
+        // IMPORTANT: only the SELF-SIGNED root(s) of the CA chain fetched from
+        // CEMA via GET /ca/{caName}/chain may be returned as trust anchors; every
+        // other certificate of that chain (e.g. an issuing sub-CA such as
+        // "CEMA User CA") must appear ONLY in getAdditionalCerts() as
+        // path-building material. Reason: Java's PKIXCertPathBuilderResult
+        // excludes the trust anchor from the returned path by contract, and
+        // RaDownstream.processCertResponse derives the downstream extraCerts
+        // ("issuingChain") from exactly that path minus the leaf. If the direct
+        // issuer of the enrolled certificate were also registered as a trust
+        // anchor, the built path would collapse to [enrolledCert] alone, the
+        // issuingChain would be empty (not null - so no error is raised) and the
+        // CertRep sent to the client would carry no usable CA certificate at all.
+        // A compliant LCMP client then cannot build the enrollment chain from
+        // response.getExtraCerts() (RFC 9483 section 3.2 entitles it to expect a
+        // usable chain there).
         return new VerificationContext() {
             @Override
             public Collection<X509Certificate> getTrustedCertificates() {
+                // Trust anchors: the self-signed root(s) of the enrollment CA chain.
                 List<X509Certificate> caChain = getAutomaticallyFetchedCaChain();
+                List<X509Certificate> roots = new ArrayList<>();
+                for (X509Certificate cert : caChain) {
+                    if (isSelfSigned(cert)) {
+                        roots.add(cert);
+                    }
+                }
                 LOG.info("enrollment verification: validating issued certificate against "
                                 + "{} trust anchor(s): {}",
-                        caChain.size(),
-                        caChain.stream()
+                        roots.size(),
+                        roots.stream()
                                 .map(c -> c.getSubjectX500Principal().getName())
                                 .collect(java.util.stream.Collectors.toList()));
-                return caChain.isEmpty() ? null : caChain;
+                return roots.isEmpty() ? null : roots;
             }
 
             @Override
             public Collection<X509Certificate> getAdditionalCerts() {
-                // Path-building material: the CA chain itself acts as intermediate
-                // source (e.g. EE <- CEMA User CA <- CEMA Root CA anchor).
-                List<X509Certificate> caChain = getAutomaticallyFetchedCaChain();
-                return caChain.isEmpty() ? null : caChain;
+                // Path-building material: the non-self-signed certificates of the
+                // CA chain (e.g. EE <- CEMA User CA <- CEMA Root CA anchor). These
+                // stay OUT of the anchor set on purpose so that PKIX keeps them in
+                // the built path and RaDownstream can forward them to the client
+                // via extraCerts.
+                List<X509Certificate> intermediates = getEnrollmentIntermediateCerts();
+                return intermediates.isEmpty() ? null : intermediates;
             }
         };
+    }
+
+    /**
+     * Non-self-signed certificates (sub-CAs, e.g. "CEMA User CA") of the CA
+     * chain fetched from CEMA - path-building material only, never trust
+     * anchors (see the note in {@link #getEnrollmentTrust}).
+     */
+    private List<X509Certificate> getEnrollmentIntermediateCerts() {
+        List<X509Certificate> intermediates = new ArrayList<>();
+        for (X509Certificate cert : getAutomaticallyFetchedCaChain()) {
+            if (cert != null && !isSelfSigned(cert)) {
+                intermediates.add(cert);
+            }
+        }
+        return intermediates;
     }
     
     @Override
@@ -669,13 +718,26 @@ public class GatewayConfig implements Configuration {
                         // a path.
                         // Trust anchors for validating signature-protected upstream
                         // responses. Resolution order:
-                        //  1. Union of: CA chain fetched automatically from CEMA
-                        //     (GET /ca/{caName}/chain), the gateway keystore certificate
-                        //     chain, and the file-based truststore (auth.truststore.path).
+                        //  1. Union of the SELF-SIGNED certificates of: the CA chain fetched
+                        //     automatically from CEMA (GET /ca/{caName}/chain), the gateway
+                        //     keystore certificate chain, and the file-based truststore
+                        //     (auth.truststore.path).
                         //  2. null only if nothing at all is available -> that makes the
                         //     RA reject signed responses; never return an empty list, which
                         //     breaks PKIX with "the trustAnchors parameter must be
                         //     non-empty".
+                        // Non-self-signed certificates (sub-CAs, leaves) are deliberately
+                        // NOT registered as anchors here: they are supplied through
+                        // getAdditionalCerts() below as path-building material instead.
+                        // The same identity must never sit in both sets - see the note in
+                        // getEnrollmentTrust(): PKIXCertPathBuilderResult excludes the
+                        // trust anchor from the returned path, so anything that is also
+                        // expected to travel inside a built chain belongs in the
+                        // additional certs only. (The previous sloppy pattern of using
+                        // whole chains - leaf included - as anchors worked here merely
+                        // because this context validates the gateway's own signer
+                        // certificate, whose direct issuer ends up somewhere else in the
+                        // merged anchor set.)
                         java.util.Set<List<X509Certificate>> anchorSources = new java.util.LinkedHashSet<>();
                         anchorSources.add(getAutomaticallyFetchedCaChain());
                         // INFO on purpose: if this ever shows selfGenerated=false while the
@@ -709,15 +771,17 @@ public class GatewayConfig implements Configuration {
                                 continue;
                             }
                             for (X509Certificate c : source) {
-                                if (c != null && seen.add(c)) {
+                                // Only self-signed certificates become trust anchors.
+                                if (c != null && isSelfSigned(c) && seen.add(c)) {
                                     trusted.add(c);
                                 }
                             }
                         }
                         if (isProcessingSelfGeneratedUpstreamMessage()) {
                             LOG.debug("upstream verification: self-generated response - merged "
-                                    + "{} trust anchor(s) (CA chain + gateway keystore chain + "
-                                    + "truststore)", trusted.size());
+                                    + "{} trust anchor(s) (self-signed certificates from the CA "
+                                    + "chain, the gateway keystore chain and the truststore)",
+                                    trusted.size());
                         }
                         if (!trusted.isEmpty()) {
                             LOG.info("upstream verification: validating protection certificate "
@@ -737,12 +801,20 @@ public class GatewayConfig implements Configuration {
 
                     @Override
                     public Collection<X509Certificate> getAdditionalCerts() {
+                        // Path-building material for the anchors returned above.
                         // The gateway signs its self-generated upstream CertReps with its
                         // own client certificate. When that certificate is not published in
                         // the truststore (e.g. issued by a different CA), supply its issuing
                         // chain here so PKIX path building can still build a valid chain to
                         // a configured trust anchor. Without this, validation fails with
                         // "validating the protection certificate failed" (signerNotTrusted).
+                        // Additionally, the non-self-signed certificates of the automatic
+                        // CA chain (issuing sub-CAs) are needed here now that
+                        // getTrustedCertificates() above only registers roots as anchors.
+                        List<X509Certificate> additional = new ArrayList<>();
+                        // Intermediate CA certificates (e.g. CEMA User CA) from the
+                        // automatic chain: everything except the self-signed root(s).
+                        additional.addAll(getEnrollmentIntermediateCerts());
                         try {
                             List<X509Certificate> chain = getCertificateChain();
                             if (chain.size() > 1) {
@@ -750,13 +822,22 @@ public class GatewayConfig implements Configuration {
                                 LOG.debug("upstream verification: supplying {} additional CA "
                                         + "certificate(s) from the gateway keystore for path "
                                         + "building", chain.size() - 1);
-                                return chain.subList(1, chain.size());
+                                additional.addAll(chain.subList(1, chain.size()));
                             }
                         } catch (Exception e) {
                             LOG.warn("upstream verification: could not load gateway certificate "
                                     + "chain for additional path-building material", e);
                         }
-                        return VerificationContext.super.getAdditionalCerts();
+                        List<X509Certificate> deduplicated = new ArrayList<>();
+                        java.util.Set<java.security.cert.X509Certificate> seen = new java.util.HashSet<>();
+                        for (X509Certificate c : additional) {
+                            if (c != null && seen.add(c)) {
+                                deduplicated.add(c);
+                            }
+                        }
+                        return deduplicated.isEmpty()
+                                ? VerificationContext.super.getAdditionalCerts()
+                                : deduplicated;
                     }
                 };
             }
