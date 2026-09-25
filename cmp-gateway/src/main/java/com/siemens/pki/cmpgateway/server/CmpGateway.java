@@ -9,8 +9,10 @@ import com.siemens.pki.cmpracomponent.configuration.Configuration;
 import com.siemens.pki.cmpracomponent.configuration.CredentialContext;
 import com.siemens.pki.cmpracomponent.configuration.NestedEndpointContext;
 import com.siemens.pki.cmpracomponent.configuration.SharedSecretCredentialContext;
+import com.siemens.pki.cmpracomponent.configuration.SignatureCredentialContext;
 import com.siemens.pki.cmpracomponent.configuration.VerificationContext;
 import com.siemens.pki.cmpracomponent.cryptoservices.AlgorithmHelper;
+import com.siemens.pki.cmpracomponent.cryptoservices.CertUtility;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent.CmpRaInterface;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent.UpstreamExchange;
@@ -35,14 +37,25 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyFactory;
 import java.security.PrivateKey;
+import java.security.cert.X509Certificate;
 import java.security.spec.PKCS8EncodedKeySpec;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
+import java.util.List;
 import java.util.Map;
+import java.util.HexFormat;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ConcurrentHashMap;
+import org.bouncycastle.asn1.ASN1Encoding;
 import org.bouncycastle.asn1.ASN1InputStream;
+import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1Primitive;
+import org.bouncycastle.asn1.DEROctetString;
+import org.bouncycastle.asn1.DERSequence;
+import org.bouncycastle.asn1.cmp.PKIHeaderBuilder;
 import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.ASN1OctetString;
 import org.bouncycastle.asn1.cmp.CMPCertificate;
@@ -50,10 +63,13 @@ import org.bouncycastle.asn1.cmp.CertOrEncCert;
 import org.bouncycastle.asn1.cmp.CertRepMessage;
 import org.bouncycastle.asn1.cmp.CertResponse;
 import org.bouncycastle.asn1.cmp.GenMsgContent;
+import org.bouncycastle.asn1.DERBitString;
 import org.bouncycastle.asn1.cmp.GenRepContent;
 import org.bouncycastle.asn1.cmp.InfoTypeAndValue;
 import org.bouncycastle.asn1.cmp.PKIBody;
+import org.bouncycastle.asn1.cmp.PKIHeader;
 import org.bouncycastle.asn1.cmp.PKIMessage;
+import org.bouncycastle.asn1.cmp.ProtectedPart;
 import org.bouncycastle.asn1.cmp.PKIStatus;
 import org.bouncycastle.asn1.cmp.PKIStatusInfo;
 import org.bouncycastle.asn1.cmp.RevDetails;
@@ -157,16 +173,28 @@ public final class CmpGateway {
         public byte[] sendReceiveMessage(
                 final byte[] request, final String certProfile, final int bodyType) throws Exception {
             final PKIMessage message = parseMessage(request);
+            // INFO level on purpose: this shows which protection the incoming EE
+            // request actually carries - the single most important diagnostic for
+            // the "validating the protection certificate failed" issue.
+            LOG.info("upstream callback: body type {}, sender='{}', protection={}, extraCerts={}",
+                    bodyType,
+                    message.getHeader().getSender() == null
+                            ? null : message.getHeader().getSender().getName(),
+                    protectionAlgorithmName(message.getHeader()),
+                    message.getExtraCerts() == null ? 0 : message.getExtraCerts().length);
             if (LOG.isDebugEnabled()) {
-                LOG.debug("upstream request received by gateway callback: LCMP body type {}, senderNID='{}', "
-                                + "protection algorithm '{}', extraCerts count {}",
-                        bodyType,
-                        message.getHeader().getSender() == null
-                                ? null : message.getHeader().getSender().getName(),
-                        message.getHeader().getProtectionAlg() == null
-                                ? "none" : message.getHeader().getProtectionAlg().getAlgorithm().getId(),
-                        message.getExtraCerts() == null ? 0 : message.getExtraCerts().length);
+                LOG.debug("upstream callback: senderKID form {}",
+                        message.getHeader().getSenderKID() == null
+                                ? "none"
+                                : message.getHeader().getSenderKID()
+                                        .toASN1Primitive().getClass().getSimpleName());
             }
+            // Full diagnostic dump of every CMP message this bridge sees, both on
+            // the wire (HTTP) and at the RA component's upstream interface. Enable
+            // with -Dcmpgateway.dumpDir=<dir> (or cmpgateway.dump.dir in
+            // gateway.properties). Dumps are DER files plus a human-readable ASN.1
+            // structure printed at DEBUG level - see dumpMessage().
+            dumpMessage(message, request, "upstream-in");
             // Remember the transaction of the request being processed so that the
             // generated upstream responses can be protected with the matching
             // credentials (see protectUpstreamResponse).
@@ -175,12 +203,32 @@ public final class CmpGateway {
             currentTransaction.set(persistencyContext);
             // Everything returned from this callback is generated by the gateway
             // itself and protected with the gateway signer certificate, which is
-            // typically not issued by the enrollment CA. Tell GatewayConfig to skip
-            // PKIX path validation of that self-generated protection certificate
-            // (see selfGeneratedUpstreamMessage) - otherwise the RA component would
-            // reject its own responses with "validating the protection certificate
-            // failed" (signerNotTrusted).
-            config.setProcessingSelfGeneratedUpstreamMessage(true);
+            // typically not issued by the enrollment CA. The RA component re-validates
+            // signature-based protection of upstream messages, including these
+            // self-generated responses (SignatureProtectionValidator runs after this
+            // callback returns): it verifies the CMPCertificate[] form of the header's
+            // senderKID against the message signature and then demands a PKIX path for
+            // it against the anchors from getUpstreamConfiguration().getInputVerification()
+            // (the CEMA CA chain). The gateway keystore key cannot sign for the EE's
+            // senderKID, so the response must carry the gateway's own signer identity:
+            // tell GatewayConfig to add the gateway keystore chain as extra trust anchor
+            // (see selfGeneratedUpstreamMessage) and override senderKID accordingly in
+            // protectUpstreamResponse().
+            // IMPORTANT: the flag must NOT be cleared in this callback's finally
+            // block - the RA validates the returned message AFTER this method has
+            // already completed (observed live: trust anchor query with
+            // "in progress=false" during validation of our own CertRep). The
+            // volatile flag stays set until the whole downstream request finished;
+            // it is cleared in CmpHandler.handle below.
+            if (isSignatureProtectedRequest(message)) {
+                // Only signature-protected EE requests lead to a self-generated,
+                // signature-protected CertRep (see protectUpstreamResponse). PBM
+                // answers reuse the request's MAC credentials and never touch the
+                // PKIX anchor path - keep the merge off for them so the gateway's
+                // REST-auth (Tomcat) certificate can never become a CMP trust
+                // anchor outside this narrow case.
+                config.setProcessingSelfGeneratedUpstreamMessage(true);
+            }
             try {
                 switch (bodyType) {
                     case PKIBody.TYPE_P10_CERT_REQ:
@@ -208,7 +256,10 @@ public final class CmpGateway {
                                 "LCMP body type " + bodyType + " is not mapped to CEMA");
                 }
             } finally {
-                config.setProcessingSelfGeneratedUpstreamMessage(false);
+                // NOTE: the self-generated-upstream flag is deliberately NOT cleared
+                // here - the RA component validates the message returned from this
+                // callback only afterwards (see comment above). It is cleared once per
+                // downstream request in handleDownstreamRequest().
                 currentTransaction.remove();
             }
         }
@@ -602,34 +653,227 @@ public final class CmpGateway {
                         StreamType.upstream(UPSTREAM_INTERFACE_NAME),
                         reusedCredentials);
             } else {
-                // No reusable credentials (unprotected, PBMAC1, or signature
-                // protected request): protect with the configured upstream
-                // output credentials (the gateway certificate).
+                // Signature-protected, unprotected or PBMAC1 protected request:
+                // protect the generated response with the configured upstream
+                // output credentials (the gateway certificate from
+                // auth.keystore.path). The RA component re-validates this
+                // self-generated protection certificate against the upstream
+                // trust anchors; GatewayConfig.getUpstreamConfiguration()
+                // merges the gateway keystore chain into those anchors while a
+                // self-generated message is being validated, so it passes.
+                final X509Certificate signer = getGatewaySignerCertificate();
+                LOG.info("protecting self-generated upstream response with the gateway "
+                                + "signature credential: subject='{}', issuer='{}'",
+                        signer == null ? "<not available>" : signer.getSubjectX500Principal(),
+                        signer == null ? "<not available>" : signer.getIssuerX500Principal());
                 protector = new MsgOutputProtector(
                         upstreamConfig,
                         StreamType.upstream(UPSTREAM_INTERFACE_NAME),
                         (MessageContext) null);
             }
-            return protector.generateAndProtectResponseTo(request, responseBody);
+            final PKIMessage generated = protector.generateAndProtectResponseTo(request, responseBody);
+            // RFC 4210 section 5.1.3.1.3 / RFC 9483 section 3.2: a CMP server MUST
+            // send all issuer-side certificates needed to build a certification path
+            // for the issued certificate in the extraCerts field of the CertRep (the
+            // CA certificates are normally sent with every response). The LCMP client
+            // stack builds its enrollment chain exclusively from these extraCerts
+            // (see CmpClient.invokeEnrollment -> TrustCredentialAdapter.
+            // validateCertAgainstTrust(issued cert, asX509Certificates(extraCerts))),
+            // so without them getEnrollmentChain() comes back null and enrollment
+            // fails client-side. MsgOutputProtector only embeds the signer's own
+            // chain here, so append the CA chain fetched via GET /ca/{caName}/chain.
+            final PKIMessage protectedResponse = appendCaChainExtraCerts(generated);
+            // Diagnostic: what the RA downstream stage will see when it validates the
+            // trust chain of the ISSUED certificate - its only path-building material
+            // is the extraCerts list of this message (RaDownstream.processCertResponse
+            // calls validateCertAgainstTrust(issued cert, asX509Certificates(extraCerts))).
+            LOG.info("self-generated upstream response ready: body type {}, granted={}, "
+                            + "extraCerts={} -> [{}]",
+                    responseBody.getType(),
+                    describeGrantStatus(responseBody),
+                    protectedResponse.getExtraCerts() == null ? 0 : protectedResponse.getExtraCerts().length,
+                    describeExtraCerts(protectedResponse));
+            // Detailed view of exactly what the RA component will re-validate
+            // (protection algorithm, header fields, KID forms, per-cert CA flags).
+            logMessageDetails("upstream-out", protectedResponse);
+            dumpMessage(protectedResponse, safeEncode(protectedResponse), "upstream-out");
+            if (!isSignatureProtectedRequest(request)) {
+                return protectedResponse;
+            }
+            // The generated header already identifies the gateway signer correctly:
+            // PkiMessageGenerator takes sender and senderKID from the signature
+            // protection provider (SKI of the gateway leaf) and only copies pvno,
+            // transactionID and nonces from the request. What is missing for a
+            // signature-protected request is the CMPCertificate[] senderKID form
+            // (RFC 4210 choice cmPCertificate): LCMP clients send it that way and
+            // expect the answer in the same form; SignatureProtectionValidator would
+            // otherwise compare the EE's embedded-certificate KID bytes with the
+            // gateway SKI. Convert the header KID to that form when the request used
+            // it - BC stores a CMPCertificate[] senderKID as an OCTET STRING wrapping
+            // the SEQUENCE of embedded certificates. extraCerts already contain the
+            // gateway chain and GatewayConfig.getUpstreamConfiguration() merges the
+            // gateway keystore chain into the trust anchors while a self-generated
+            // message is being validated, so the PKIX check passes too.
+            final X509Certificate gatewaySigner = getGatewaySignerCertificate();
+            if (gatewaySigner == null) {
+                LOG.warn("cannot rewrite senderKID of the self-generated signature-"
+                        + "protected upstream response: gateway signer certificate not"
+                        + " available");
+                return protectedResponse;
+            }
+            if (!(request.getHeader().getSenderKID().toASN1Primitive() instanceof DERBitString)) {
+                // Request used the subject key identifier form (or no KID at all):
+                // the generated header already matches the gateway signer.
+                return protectedResponse;
+            }
+            try {
+                final ASN1OctetString newKid = new DEROctetString(new DERSequence(
+                        CMPCertificate.getInstance(gatewaySigner.getEncoded())));
+                final PKIHeader requestHeader = protectedResponse.getHeader();
+                final PKIHeaderBuilder rewrittenHeader = new PKIHeaderBuilder(
+                        requestHeader.getPvno().intValueExact(),
+                        requestHeader.getSender(),
+                        requestHeader.getRecipient());
+                rewrittenHeader.setMessageTime(requestHeader.getMessageTime());
+                rewrittenHeader.setProtectionAlg(requestHeader.getProtectionAlg());
+                rewrittenHeader.setSenderKID(newKid);
+                rewrittenHeader.setTransactionID(requestHeader.getTransactionID());
+                rewrittenHeader.setSenderNonce(requestHeader.getSenderNonce());
+                rewrittenHeader.setRecipNonce(requestHeader.getRecipNonce());
+                rewrittenHeader.setGeneralInfo(requestHeader.getGeneralInfo());
+                return new PKIMessage(rewrittenHeader.build(), protectedResponse.getBody(),
+                        protectedResponse.getProtection(), protectedResponse.getExtraCerts());
+            } catch (final Exception ex) {
+                throw new IOException("could not rewrite senderKID of the self-generated"
+                        + " signature-protected upstream response", ex);
+            }
         }
 
         /**
-         * Human-readable name of the protection algorithm in a PKI header, for logging.
+         * Diagnostic helper: short description of the CertRep status for logging.
          */
-        private static String protectionAlgorithmName(final org.bouncycastle.asn1.cmp.PKIHeader header) {
-            final org.bouncycastle.asn1.x509.AlgorithmIdentifier alg = header.getProtectionAlg();
-            if (alg == null) {
-                return "none";
+        private static String describeGrantStatus(final PKIBody responseBody) {
+            try {
+                if (responseBody.getContent() instanceof org.bouncycastle.asn1.cmp.CertRepMessage) {
+                    final org.bouncycastle.asn1.cmp.CertRepMessage rep =
+                            (org.bouncycastle.asn1.cmp.CertRepMessage) responseBody.getContent();
+                    if (rep.getResponse() != null && rep.getResponse().length > 0) {
+                        return String.valueOf(rep.getResponse()[0].getStatus().getStatus());
+                    }
+                }
+            } catch (final Exception ex) {
+                // diagnostic only - never fail the real flow because of logging
             }
-            final String oid = alg.getAlgorithm().getId();
-            if (org.bouncycastle.asn1.cmp.CMPObjectIdentifiers.passwordBasedMac.equals(alg.getAlgorithm())) {
-                return "PasswordBasedMac (" + oid + ")";
-            }
-            if (org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.id_PBMAC1.equals(alg.getAlgorithm())) {
-                return "PBMAC1 (" + oid + ")";
-            }
-            return "signature (" + oid + ")";
+            return "n/a";
         }
+
+        /**
+         * Diagnostic helper: subject/issuer of every certificate embedded in the
+         * extraCerts of a message. The RA downstream validation of the issued
+         * certificate builds its PKIX path using ONLY these certificates plus the
+         * enrollment trust anchors, so this list tells you whether the issuing CA
+         * chain from CEMA actually made it into the CertRep.
+         */
+
+
+        /**
+         * Diagnostic helper: render the key usage bits of a certificate compactly.
+         */
+
+
+        /**
+         * True if the request carries signature-based protection (i.e. neither
+         * unprotected, nor PasswordBasedMac, nor PBMAC1).
+         */
+        private static boolean isSignatureProtectedRequest(final PKIMessage request) {
+            final org.bouncycastle.asn1.x509.AlgorithmIdentifier protectionAlg =
+                    request.getHeader().getProtectionAlg();
+            if (protectionAlg == null) {
+                return false;
+            }
+            final ASN1ObjectIdentifier oid = protectionAlg.getAlgorithm();
+            return !org.bouncycastle.asn1.cmp.CMPObjectIdentifiers.passwordBasedMac.equals(oid)
+                    && !org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.id_PBMAC1.equals(oid);
+        }
+
+        /**
+         * Append the CA chain (fetched via GET /ca/{caName}/chain) to the extraCerts
+         * of a self-generated CertRep, as required by RFC 4210 section 5.1.3.1.3 and
+         * RFC 9483 section 3.2: the server must deliver all certificates needed to
+         * build a certification path for the issued certificate with every response.
+         * LCMP clients have no other source for these issuer-side certificates -
+         * without them getEnrollmentChain() returns null on the client side.
+         */
+        private PKIMessage appendCaChainExtraCerts(final PKIMessage message) {
+            try {
+                final List<X509Certificate> caChain = config.getAutomaticallyFetchedCaChain();
+                if (caChain == null || caChain.isEmpty()) {
+                    return message;
+                }
+                final org.bouncycastle.asn1.cmp.CMPCertificate[] old =
+                        message.getExtraCerts() == null
+                                ? new org.bouncycastle.asn1.cmp.CMPCertificate[0]
+                                : message.getExtraCerts();
+                final java.util.List<org.bouncycastle.asn1.cmp.CMPCertificate> merged =
+                        new ArrayList<>(Arrays.asList(old));
+                int added = 0;
+                for (final X509Certificate cert : caChain) {
+                    final org.bouncycastle.asn1.cmp.CMPCertificate cmpCert =
+                            org.bouncycastle.asn1.cmp.CMPCertificate.getInstance(
+                                    cert.getEncoded());
+                    // Skip duplicates (e.g. gateway signer chain already embedded by
+                    // MsgOutputProtector, or a CA cert that is also a trust anchor).
+                    if (!containsEncoded(merged, cmpCert)) {
+                        merged.add(cmpCert);
+                        added++;
+                    }
+                }
+                if (added == 0) {
+                    return message;
+                }
+                LOG.info("appended {} CA certificate(s) from '{}' to the extraCerts of the "
+                                + "self-generated upstream response (RFC 4210 5.1.3.1.3)",
+                        added, "GET /ca/" + config.getCaName() + "/chain");
+                return new PKIMessage(message.getHeader(), message.getBody(),
+                        message.getProtection(),
+                        merged.toArray(new org.bouncycastle.asn1.cmp.CMPCertificate[0]));
+            } catch (final Exception ex) {
+                // Never fail the enrollment because of the convenience chain; the
+                // client may still hold the CA certificates itself.
+                LOG.warn("could not append the CA chain to the extraCerts of the "
+                        + "self-generated upstream response", ex);
+                return message;
+            }
+        }
+
+        private static boolean containsEncoded(
+                final java.util.List<org.bouncycastle.asn1.cmp.CMPCertificate> list,
+                final org.bouncycastle.asn1.cmp.CMPCertificate candidate)
+                throws java.io.IOException {
+            final byte[] encoded = candidate.getEncoded(ASN1Encoding.DER);
+            for (final org.bouncycastle.asn1.cmp.CMPCertificate existing : list) {
+                if (Arrays.equals(existing.getEncoded(ASN1Encoding.DER), encoded)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * The leaf certificate of the gateway keystore (auth.keystore.path), i.e.
+         * the certificate the RA component signs self-generated upstream responses
+         * with. Null if no keystore is configured or it cannot be read.
+         */
+        private X509Certificate getGatewaySignerCertificate() {
+            try {
+                final List<X509Certificate> chain = config.getCertificateChain();
+                return chain == null || chain.isEmpty() ? null : chain.get(0);
+            } catch (final Exception ex) {
+                LOG.warn("could not load the gateway keystore certificate chain", ex);
+                return null;
+            }
+        }
+
 
         /**
          * Derive the credential context to protect an upstream response with,
@@ -755,6 +999,298 @@ public final class CmpGateway {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Diagnostics: message dumps and detailed structure logging
+    // ---------------------------------------------------------------------
+
+    /**
+     * Human-readable name of the protection algorithm in a PKI header, for logging.
+     */
+    private static String protectionAlgorithmName(final org.bouncycastle.asn1.cmp.PKIHeader header) {
+        final org.bouncycastle.asn1.x509.AlgorithmIdentifier alg = header.getProtectionAlg();
+        if (alg == null) {
+            return "none";
+        }
+        final String oid = alg.getAlgorithm().getId();
+        if (org.bouncycastle.asn1.cmp.CMPObjectIdentifiers.passwordBasedMac.equals(alg.getAlgorithm())) {
+            return "PasswordBasedMac (" + oid + ")";
+        }
+        if (org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.id_PBMAC1.equals(alg.getAlgorithm())) {
+            return "PBMAC1 (" + oid + ")";
+        }
+        return "signature (" + oid + ")";
+    }
+
+    private static String describeExtraCerts(final PKIMessage message) {
+        final org.bouncycastle.asn1.cmp.CMPCertificate[] extra = message.getExtraCerts();
+        if (extra == null || extra.length == 0) {
+            return "";
+        }
+        final StringBuilder sb = new StringBuilder();
+        for (final org.bouncycastle.asn1.cmp.CMPCertificate c : extra) {
+            try {
+                final X509Certificate x = CertUtility.asX509Certificate(c);
+                if (sb.length() > 0) {
+                    sb.append(", ");
+                }
+                // Diagnostic detail: the RA component's TrustCredentialAdapter drops
+                // every extraCert that is not marked as a CA certificate (BasicConstraints
+                // cA=true, see CertUtility.isIntermediateCertificate / BC's
+                // X509CertificateHolder.isCA) when collecting path-building material, and
+                // JDK PKIX ignores non-CA candidates entirely. A cert with a missing or
+                // non-critical BasicConstraints extension therefore silently breaks chain
+                // building even though subject/issuer names look perfect - which is exactly
+                // what "error building enrollment chain" (client) / "could not validate
+                // trust chain of issued certificate" (RA downstream) looked like here.
+                sb.append(x.getSubjectX500Principal().getName())
+                        .append(" <- ")
+                        .append(x.getIssuerX500Principal().getName());
+                try {
+                    final int bc = x.getBasicConstraints();
+                    sb.append(" [BC=").append(bc < 0 ? "none/leaf" : ("critical,pathLen=" + bc))
+                            .append(", KU=").append(keyUsageToString(x.getKeyUsage()))
+                            .append("]");
+                } catch (final Exception ignored) {
+                    // extension parsing is diagnostic only
+                }
+            } catch (final Exception ex) {
+                if (sb.length() > 0) {
+                    sb.append(", ");
+                }
+                sb.append("<unreadable>");
+            }
+        }
+        return sb.toString();
+    }
+
+    private static String keyUsageToString(final boolean[] ku) {
+        if (ku == null) {
+            return "none";
+        }
+        final String[] names = {"digitalSignature", "nonRepudiation", "keyEncipherment",
+                "dataEncipherment", "keyAgreement", "keyCertSign", "cRLSign",
+                "encipherOnly", "decipherOnly"};
+        final StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < ku.length && i < names.length; i++) {
+            if (ku[i]) {
+                if (sb.length() > 0) {
+                    sb.append('|');
+                }
+                sb.append(names[i]);
+            }
+        }
+        return sb.length() == 0 ? "empty" : sb.toString();
+    }
+
+    /** Directory for DER message dumps; null (default) disables file dumping. */
+    private static final String DUMP_DIR = System.getProperty("cmpgateway.dumpDir");
+    private static final java.util.concurrent.atomic.AtomicLong DUMP_SEQ =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Write a full diagnostic dump of a CMP message: the raw DER to a .cer/.der
+     * file in {@link #DUMP_DIR} (if configured) plus a human-readable structure
+     * at DEBUG level. Never throws - diagnostics must not break the real flow.
+     */
+    private void dumpMessage(final PKIMessage message, final byte[] encoded, final String stage) {
+        logMessageDetails(stage, message);
+        if (DUMP_DIR == null || DUMP_DIR.isBlank() || encoded == null) {
+            return;
+        }
+        try {
+            final java.nio.file.Path dir = java.nio.file.Path.of(DUMP_DIR);
+            java.nio.file.Files.createDirectories(dir);
+            final PKIHeader header = message.getHeader();
+            final String txId = header.getTransactionID() == null
+                    ? "notx" : HexFormat.of().formatHex(header.getTransactionID().getOctets());
+            final String name = String.format("%04d-%s-tx-%s.der",
+                    DUMP_SEQ.incrementAndGet(), stage, txId);
+            java.nio.file.Files.write(dir.resolve(name), encoded);
+            LOG.info("message dump written to {}", dir.resolve(name));
+        } catch (final Exception ex) {
+            LOG.warn("could not write message dump for stage {}", stage, ex);
+        }
+    }
+
+    /**
+     * Detailed INFO/DEBUG logging of one CMP message: header fields (sender,
+     * recipient, senderKID/recipientKID form + hex, nonces, transactionID,
+     * pvno, messageTime), protection algorithm, body type, per-cert detail of
+     * extraCerts (subject &lt;- issuer [CA flag]), and - at DEBUG - the complete
+     * ASN.1 structure via ASN1Dump. This is what you need to compare against
+     * RFC 4210 / RFC 9483 expectations.
+     */
+    private void logMessageDetails(final String stage, final PKIMessage message) {
+        try {
+            final PKIHeader header = message.getHeader();
+            LOG.info("[{}] CMP message detail: pvno={}, bodyType={} ({}), sender='{}', "
+                            + "recipient='{}', transactionID={}, senderNonce={}, recipNonce={}",
+                    stage,
+                    header.getPvno().intValueExact(),
+                    message.getBody().getType(),
+                    bodyTypeName(message.getBody().getType()),
+                    header.getSender() == null ? null : header.getSender().getName(),
+                    header.getRecipient() == null ? null : header.getRecipient().getName(),
+                    header.getTransactionID() == null
+                            ? "none" : HexFormat.of().formatHex(header.getTransactionID().getOctets()),
+                    header.getSenderNonce() == null
+                            ? "none" : HexFormat.of().formatHex(header.getSenderNonce().getOctets()),
+                    header.getRecipNonce() == null
+                            ? "none" : HexFormat.of().formatHex(header.getRecipNonce().getOctets()));
+            LOG.info("[{}] protection: alg={}, senderKID form={} value={}",
+                    stage,
+                    protectionAlgorithmName(header),
+                    asn1FormName(header.getSenderKID()),
+                    asn1Hex(header.getSenderKID()));
+            final org.bouncycastle.asn1.cmp.CMPCertificate[] extra = message.getExtraCerts();
+            LOG.info("[{}] extraCerts ({}) -> [{}]",
+                    stage,
+                    extra == null ? 0 : extra.length,
+                    describeExtraCerts(message));
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("[{}] issued cert detail: {}", stage, describeCertBody(message));
+                LOG.debug("[{}] full ASN.1 structure:\n{}", stage,
+                        org.bouncycastle.asn1.util.ASN1Dump.dumpAsString(
+                                ASN1Primitive.fromByteArray(message.getEncoded()), true));
+            }
+        } catch (final Exception ex) {
+            // diagnostic only - never fail the real flow because of logging
+            LOG.debug("could not produce message detail for stage {}", stage, ex);
+        }
+    }
+
+    /** Short readable name for every PKIBody type tag used by this gateway. */
+    private static String bodyTypeName(final int type) {
+        switch (type) {
+            case PKIBody.TYPE_INIT_REQ: return "IR";
+            case PKIBody.TYPE_INIT_REP: return "IP";
+            case PKIBody.TYPE_CERT_REQ: return "CR";
+            case PKIBody.TYPE_CERT_REP: return "CP";
+            case PKIBody.TYPE_P10_CERT_REQ: return "P10CR";
+            case PKIBody.TYPE_REVOCATION_REQ: return "RR";
+            case PKIBody.TYPE_REVOCATION_REP: return "RP";
+            case PKIBody.TYPE_KEY_UPDATE_REQ: return "KUR";
+            case PKIBody.TYPE_KEY_UPDATE_REP: return "KUP";
+            case PKIBody.TYPE_KEY_RECOVERY_REQ: return "KRR";
+            case PKIBody.TYPE_KEY_RECOVERY_REP: return "KRP";
+            case PKIBody.TYPE_GEN_MSG: return "genm";
+            case PKIBody.TYPE_ERROR: return "error";
+            default: return "type-" + type;
+        }
+    }
+
+    /**
+     * ASN.1 CHOICE form of a senderKID: raw SKI bytes wrapped in an OCTET STRING
+     * (the usual encoding) versus the CMPCertificate[] form (RFC 4210 choice
+     * cmPCertificate), detected by trying to parse the inner content as a
+     * certificate SEQUENCE.
+     */
+    private static String asn1FormName(final org.bouncycastle.asn1.ASN1Encodable kid) {
+        if (kid == null) {
+            return "none";
+        }
+        try {
+            final byte[] raw = rawKidBytes(kid);
+            if (raw == null) {
+                return kid.getClass().getSimpleName();
+            }
+            try (ASN1InputStream in = new ASN1InputStream(raw)) {
+                final ASN1Primitive inner = in.readObject();
+                if (inner instanceof org.bouncycastle.asn1.ASN1Sequence) {
+                    final org.bouncycastle.asn1.ASN1Encodable first =
+                            ((org.bouncycastle.asn1.ASN1Sequence) inner).getObjectAt(0);
+                    if (first instanceof org.bouncycastle.asn1.ASN1Sequence) {
+                        try {
+                            Certificate.getInstance(first);
+                            return "CMPCertificate[]";
+                        } catch (final Exception ignored) {
+                            // not a certificate sequence
+                        }
+                    }
+                }
+                return "SKI/raw(" + inner.getClass().getSimpleName() + ")";
+            }
+        } catch (final Exception ex) {
+            return "raw-bytes";
+        }
+    }
+
+    /** Unwrap the DERBitString/OCTET STRING wrapper of a senderKID to its payload. */
+    private static byte[] rawKidBytes(final org.bouncycastle.asn1.ASN1Encodable kid)
+            throws java.io.IOException {
+        final ASN1Primitive p = kid.toASN1Primitive();
+        if (p instanceof DERBitString) {
+            return ((DERBitString) p).getBytes();
+        }
+        if (p instanceof ASN1OctetString) {
+            return ((ASN1OctetString) p).getOctets();
+        }
+        return p.getEncoded(ASN1Encoding.DER);
+    }
+
+    private static String asn1Hex(final org.bouncycastle.asn1.ASN1Encodable encodable) {
+        if (encodable == null) {
+            return "none";
+        }
+        try {
+            final byte[] bytes = rawKidBytes(encodable);
+            final HexFormat hex = HexFormat.of();
+            return bytes.length > 64
+                    ? hex.formatHex(Arrays.copyOf(bytes, 64)) + "... (" + bytes.length + " B)"
+                    : hex.formatHex(bytes);
+        } catch (final Exception ex) {
+            return "<unencodable>";
+        }
+    }
+
+        /**
+     * Subject/issuer/serial/key-alg/validity of the certificate granted inside a
+     * CertRep body (first CertResponse), for DEBUG-level comparison with the
+     * client-side enrollment chain build. Uses X509Certificate via CertUtility
+     * because BC's ASN.1 Certificate has no convenience getters.
+     */
+    private static String describeCertBody(final PKIMessage message) {
+        try {
+            final Object content = message.getBody().getContent();
+            org.bouncycastle.asn1.cmp.CertResponse[] responses = null;
+            if (content instanceof CertRepMessage) {
+                responses = ((CertRepMessage) content).getResponse();
+            }
+            if (responses == null || responses.length == 0
+                    || responses[0].getCertifiedKeyPair() == null
+                    || responses[0].getCertifiedKeyPair().getCertOrEncCert() == null) {
+                return "no issued certificate in body";
+            }
+            final X509Certificate x = CertUtility.asX509Certificate(
+                    responses[0].getCertifiedKeyPair().getCertOrEncCert().getCertificate());
+            return "subject=" + x.getSubjectX500Principal()
+                    + ", issuer=" + x.getIssuerX500Principal()
+                    + ", serial=" + x.getSerialNumber()
+                    + ", sigAlg=" + x.getSigAlgName()
+                    + " (" + x.getSigAlgOID() + ")"
+                    + ", notBefore=" + x.getNotBefore()
+                    + ", notAfter=" + x.getNotAfter()
+                    + ", pubKey=" + x.getPublicKey().getAlgorithm()
+                    + "/" + (x.getPublicKey() instanceof java.security.interfaces.RSAPublicKey
+                            ? ((java.security.interfaces.RSAPublicKey) x.getPublicKey())
+                                    .getModulus().bitLength() + " bit"
+                            : "see key")
+                    + ", derLen=" + x.getEncoded().length + " B"
+                    + ", criticalBC=" + (x.getBasicConstraints() >= 0
+                            ? "CA,pathlen=" + x.getBasicConstraints() : "leaf");
+        } catch (final Exception ex) {
+            return "<unavailable: " + ex.getMessage() + ">";
+        }
+    }
+
+    private static byte[] safeEncode(final PKIMessage message) {
+        try {
+            return message.getEncoded(ASN1Encoding.DER);
+        } catch (final Exception ex) {
+            return null;
+        }
+    }
+
     private final class CmpHandler implements HttpHandler {
         @Override
         public void handle(final HttpExchange exchange) throws IOException {
@@ -763,7 +1299,17 @@ public final class CmpGateway {
                     exchange.sendResponseHeaders(405, -1);
                     return;
                 }
-                final byte[] response = cmpRaInterface.processRequest(exchange.getRequestBody().readAllBytes());
+                // The RA component may set (via our upstream exchange callback) the
+                // "self-generated upstream message" flag in GatewayConfig to merge the
+                // gateway keystore chain into the upstream trust anchors. That flag is
+                // intentionally kept until validation finished - clear it here, once
+                // per downstream request, after processRequest returned/failed.
+                final byte[] response;
+                try {
+                    response = cmpRaInterface.processRequest(exchange.getRequestBody().readAllBytes());
+                } finally {
+                    config.setProcessingSelfGeneratedUpstreamMessage(false);
+                }
                 if (response == null) {
                     exchange.sendResponseHeaders(204, -1);
                     return;
