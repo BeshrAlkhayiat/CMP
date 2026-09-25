@@ -45,6 +45,7 @@ import java.util.Base64;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.HexFormat;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ConcurrentHashMap;
@@ -188,6 +189,12 @@ public final class CmpGateway {
                                 : message.getHeader().getSenderKID()
                                         .toASN1Primitive().getClass().getSimpleName());
             }
+            // Full diagnostic dump of every CMP message this bridge sees, both on
+            // the wire (HTTP) and at the RA component's upstream interface. Enable
+            // with -Dcmpgateway.dumpDir=<dir> (or cmpgateway.dump.dir in
+            // gateway.properties). Dumps are DER files plus a human-readable ASN.1
+            // structure printed at DEBUG level - see dumpMessage().
+            dumpMessage(message, request, "upstream-in");
             // Remember the transaction of the request being processed so that the
             // generated upstream responses can be protected with the matching
             // credentials (see protectUpstreamResponse).
@@ -686,6 +693,10 @@ public final class CmpGateway {
                     describeGrantStatus(responseBody),
                     protectedResponse.getExtraCerts() == null ? 0 : protectedResponse.getExtraCerts().length,
                     describeExtraCerts(protectedResponse));
+            // Detailed view of exactly what the RA component will re-validate
+            // (protection algorithm, header fields, KID forms, per-cert CA flags).
+            logMessageDetails("upstream-out", protectedResponse);
+            dumpMessage(protectedResponse, safeEncode(protectedResponse), "upstream-out");
             if (!isSignatureProtectedRequest(request)) {
                 return protectedResponse;
             }
@@ -763,69 +774,12 @@ public final class CmpGateway {
          * enrollment trust anchors, so this list tells you whether the issuing CA
          * chain from CEMA actually made it into the CertRep.
          */
-        private static String describeExtraCerts(final PKIMessage message) {
-            final org.bouncycastle.asn1.cmp.CMPCertificate[] extra = message.getExtraCerts();
-            if (extra == null || extra.length == 0) {
-                return "";
-            }
-            final StringBuilder sb = new StringBuilder();
-            for (final org.bouncycastle.asn1.cmp.CMPCertificate c : extra) {
-                try {
-                    final X509Certificate x = CertUtility.asX509Certificate(c);
-                    if (sb.length() > 0) {
-                        sb.append(", ");
-                    }
-                    // Diagnostic detail: the RA component's TrustCredentialAdapter drops
-                    // every extraCert that is not marked as a CA certificate (BasicConstraints
-                    // cA=true, see CertUtility.isIntermediateCertificate / BC's
-                    // X509CertificateHolder.isCA) when collecting path-building material, and
-                    // JDK PKIX ignores non-CA candidates entirely. A cert with a missing or
-                    // non-critical BasicConstraints extension therefore silently breaks chain
-                    // building even though subject/issuer names look perfect - which is exactly
-                    // what "error building enrollment chain" (client) / "could not validate
-                    // trust chain of issued certificate" (RA downstream) looked like here.
-                    sb.append(x.getSubjectX500Principal().getName())
-                            .append(" <- ")
-                            .append(x.getIssuerX500Principal().getName());
-                    try {
-                        final int bc = x.getBasicConstraints();
-                        sb.append(" [BC=").append(bc < 0 ? "none/leaf" : ("critical,pathLen=" + bc))
-                                .append(", KU=").append(keyUsageToString(x.getKeyUsage()))
-                                .append("]");
-                    } catch (final Exception ignored) {
-                        // extension parsing is diagnostic only
-                    }
-                } catch (final Exception ex) {
-                    if (sb.length() > 0) {
-                        sb.append(", ");
-                    }
-                    sb.append("<unreadable>");
-                }
-            }
-            return sb.toString();
-        }
+
 
         /**
          * Diagnostic helper: render the key usage bits of a certificate compactly.
          */
-        private static String keyUsageToString(final boolean[] ku) {
-            if (ku == null) {
-                return "none";
-            }
-            final String[] names = {"digitalSignature", "nonRepudiation", "keyEncipherment",
-                    "dataEncipherment", "keyAgreement", "keyCertSign", "cRLSign",
-                    "encipherOnly", "decipherOnly"};
-            final StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < ku.length && i < names.length; i++) {
-                if (ku[i]) {
-                    if (sb.length() > 0) {
-                        sb.append('|');
-                    }
-                    sb.append(names[i]);
-                }
-            }
-            return sb.length() == 0 ? "empty" : sb.toString();
-        }
+
 
         /**
          * True if the request carries signature-based protection (i.e. neither
@@ -920,23 +874,6 @@ public final class CmpGateway {
             }
         }
 
-        /**
-         * Human-readable name of the protection algorithm in a PKI header, for logging.
-         */
-        private static String protectionAlgorithmName(final org.bouncycastle.asn1.cmp.PKIHeader header) {
-            final org.bouncycastle.asn1.x509.AlgorithmIdentifier alg = header.getProtectionAlg();
-            if (alg == null) {
-                return "none";
-            }
-            final String oid = alg.getAlgorithm().getId();
-            if (org.bouncycastle.asn1.cmp.CMPObjectIdentifiers.passwordBasedMac.equals(alg.getAlgorithm())) {
-                return "PasswordBasedMac (" + oid + ")";
-            }
-            if (org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.id_PBMAC1.equals(alg.getAlgorithm())) {
-                return "PBMAC1 (" + oid + ")";
-            }
-            return "signature (" + oid + ")";
-        }
 
         /**
          * Derive the credential context to protect an upstream response with,
@@ -1059,6 +996,298 @@ public final class CmpGateway {
     private static PKIMessage parseMessage(final byte[] encoded) throws IOException {
         try (ASN1InputStream input = new ASN1InputStream(encoded)) {
             return PKIMessage.getInstance(input.readObject());
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Diagnostics: message dumps and detailed structure logging
+    // ---------------------------------------------------------------------
+
+    /**
+     * Human-readable name of the protection algorithm in a PKI header, for logging.
+     */
+    private static String protectionAlgorithmName(final org.bouncycastle.asn1.cmp.PKIHeader header) {
+        final org.bouncycastle.asn1.x509.AlgorithmIdentifier alg = header.getProtectionAlg();
+        if (alg == null) {
+            return "none";
+        }
+        final String oid = alg.getAlgorithm().getId();
+        if (org.bouncycastle.asn1.cmp.CMPObjectIdentifiers.passwordBasedMac.equals(alg.getAlgorithm())) {
+            return "PasswordBasedMac (" + oid + ")";
+        }
+        if (org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.id_PBMAC1.equals(alg.getAlgorithm())) {
+            return "PBMAC1 (" + oid + ")";
+        }
+        return "signature (" + oid + ")";
+    }
+
+    private static String describeExtraCerts(final PKIMessage message) {
+        final org.bouncycastle.asn1.cmp.CMPCertificate[] extra = message.getExtraCerts();
+        if (extra == null || extra.length == 0) {
+            return "";
+        }
+        final StringBuilder sb = new StringBuilder();
+        for (final org.bouncycastle.asn1.cmp.CMPCertificate c : extra) {
+            try {
+                final X509Certificate x = CertUtility.asX509Certificate(c);
+                if (sb.length() > 0) {
+                    sb.append(", ");
+                }
+                // Diagnostic detail: the RA component's TrustCredentialAdapter drops
+                // every extraCert that is not marked as a CA certificate (BasicConstraints
+                // cA=true, see CertUtility.isIntermediateCertificate / BC's
+                // X509CertificateHolder.isCA) when collecting path-building material, and
+                // JDK PKIX ignores non-CA candidates entirely. A cert with a missing or
+                // non-critical BasicConstraints extension therefore silently breaks chain
+                // building even though subject/issuer names look perfect - which is exactly
+                // what "error building enrollment chain" (client) / "could not validate
+                // trust chain of issued certificate" (RA downstream) looked like here.
+                sb.append(x.getSubjectX500Principal().getName())
+                        .append(" <- ")
+                        .append(x.getIssuerX500Principal().getName());
+                try {
+                    final int bc = x.getBasicConstraints();
+                    sb.append(" [BC=").append(bc < 0 ? "none/leaf" : ("critical,pathLen=" + bc))
+                            .append(", KU=").append(keyUsageToString(x.getKeyUsage()))
+                            .append("]");
+                } catch (final Exception ignored) {
+                    // extension parsing is diagnostic only
+                }
+            } catch (final Exception ex) {
+                if (sb.length() > 0) {
+                    sb.append(", ");
+                }
+                sb.append("<unreadable>");
+            }
+        }
+        return sb.toString();
+    }
+
+    private static String keyUsageToString(final boolean[] ku) {
+        if (ku == null) {
+            return "none";
+        }
+        final String[] names = {"digitalSignature", "nonRepudiation", "keyEncipherment",
+                "dataEncipherment", "keyAgreement", "keyCertSign", "cRLSign",
+                "encipherOnly", "decipherOnly"};
+        final StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < ku.length && i < names.length; i++) {
+            if (ku[i]) {
+                if (sb.length() > 0) {
+                    sb.append('|');
+                }
+                sb.append(names[i]);
+            }
+        }
+        return sb.length() == 0 ? "empty" : sb.toString();
+    }
+
+    /** Directory for DER message dumps; null (default) disables file dumping. */
+    private static final String DUMP_DIR = System.getProperty("cmpgateway.dumpDir");
+    private static final java.util.concurrent.atomic.AtomicLong DUMP_SEQ =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Write a full diagnostic dump of a CMP message: the raw DER to a .cer/.der
+     * file in {@link #DUMP_DIR} (if configured) plus a human-readable structure
+     * at DEBUG level. Never throws - diagnostics must not break the real flow.
+     */
+    private void dumpMessage(final PKIMessage message, final byte[] encoded, final String stage) {
+        logMessageDetails(stage, message);
+        if (DUMP_DIR == null || DUMP_DIR.isBlank() || encoded == null) {
+            return;
+        }
+        try {
+            final java.nio.file.Path dir = java.nio.file.Path.of(DUMP_DIR);
+            java.nio.file.Files.createDirectories(dir);
+            final PKIHeader header = message.getHeader();
+            final String txId = header.getTransactionID() == null
+                    ? "notx" : HexFormat.of().formatHex(header.getTransactionID().getOctets());
+            final String name = String.format("%04d-%s-tx-%s.der",
+                    DUMP_SEQ.incrementAndGet(), stage, txId);
+            java.nio.file.Files.write(dir.resolve(name), encoded);
+            LOG.info("message dump written to {}", dir.resolve(name));
+        } catch (final Exception ex) {
+            LOG.warn("could not write message dump for stage {}", stage, ex);
+        }
+    }
+
+    /**
+     * Detailed INFO/DEBUG logging of one CMP message: header fields (sender,
+     * recipient, senderKID/recipientKID form + hex, nonces, transactionID,
+     * pvno, messageTime), protection algorithm, body type, per-cert detail of
+     * extraCerts (subject &lt;- issuer [CA flag]), and - at DEBUG - the complete
+     * ASN.1 structure via ASN1Dump. This is what you need to compare against
+     * RFC 4210 / RFC 9483 expectations.
+     */
+    private void logMessageDetails(final String stage, final PKIMessage message) {
+        try {
+            final PKIHeader header = message.getHeader();
+            LOG.info("[{}] CMP message detail: pvno={}, bodyType={} ({}), sender='{}', "
+                            + "recipient='{}', transactionID={}, senderNonce={}, recipNonce={}",
+                    stage,
+                    header.getPvno().intValueExact(),
+                    message.getBody().getType(),
+                    bodyTypeName(message.getBody().getType()),
+                    header.getSender() == null ? null : header.getSender().getName(),
+                    header.getRecipient() == null ? null : header.getRecipient().getName(),
+                    header.getTransactionID() == null
+                            ? "none" : HexFormat.of().formatHex(header.getTransactionID().getOctets()),
+                    header.getSenderNonce() == null
+                            ? "none" : HexFormat.of().formatHex(header.getSenderNonce().getOctets()),
+                    header.getRecipNonce() == null
+                            ? "none" : HexFormat.of().formatHex(header.getRecipNonce().getOctets()));
+            LOG.info("[{}] protection: alg={}, senderKID form={} value={}",
+                    stage,
+                    protectionAlgorithmName(header),
+                    asn1FormName(header.getSenderKID()),
+                    asn1Hex(header.getSenderKID()));
+            final org.bouncycastle.asn1.cmp.CMPCertificate[] extra = message.getExtraCerts();
+            LOG.info("[{}] extraCerts ({}) -> [{}]",
+                    stage,
+                    extra == null ? 0 : extra.length,
+                    describeExtraCerts(message));
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("[{}] issued cert detail: {}", stage, describeCertBody(message));
+                LOG.debug("[{}] full ASN.1 structure:\n{}", stage,
+                        org.bouncycastle.asn1.util.ASN1Dump.dumpAsString(
+                                ASN1Primitive.fromByteArray(message.getEncoded()), true));
+            }
+        } catch (final Exception ex) {
+            // diagnostic only - never fail the real flow because of logging
+            LOG.debug("could not produce message detail for stage {}", stage, ex);
+        }
+    }
+
+    /** Short readable name for every PKIBody type tag used by this gateway. */
+    private static String bodyTypeName(final int type) {
+        switch (type) {
+            case PKIBody.TYPE_INIT_REQ: return "IR";
+            case PKIBody.TYPE_INIT_REP: return "IP";
+            case PKIBody.TYPE_CERT_REQ: return "CR";
+            case PKIBody.TYPE_CERT_REP: return "CP";
+            case PKIBody.TYPE_P10_CERT_REQ: return "P10CR";
+            case PKIBody.TYPE_REVOCATION_REQ: return "RR";
+            case PKIBody.TYPE_REVOCATION_REP: return "RP";
+            case PKIBody.TYPE_KEY_UPDATE_REQ: return "KUR";
+            case PKIBody.TYPE_KEY_UPDATE_REP: return "KUP";
+            case PKIBody.TYPE_KEY_RECOVERY_REQ: return "KRR";
+            case PKIBody.TYPE_KEY_RECOVERY_REP: return "KRP";
+            case PKIBody.TYPE_GEN_MSG: return "genm";
+            case PKIBody.TYPE_ERROR: return "error";
+            default: return "type-" + type;
+        }
+    }
+
+    /**
+     * ASN.1 CHOICE form of a senderKID: raw SKI bytes wrapped in an OCTET STRING
+     * (the usual encoding) versus the CMPCertificate[] form (RFC 4210 choice
+     * cmPCertificate), detected by trying to parse the inner content as a
+     * certificate SEQUENCE.
+     */
+    private static String asn1FormName(final org.bouncycastle.asn1.ASN1Encodable kid) {
+        if (kid == null) {
+            return "none";
+        }
+        try {
+            final byte[] raw = rawKidBytes(kid);
+            if (raw == null) {
+                return kid.getClass().getSimpleName();
+            }
+            try (ASN1InputStream in = new ASN1InputStream(raw)) {
+                final ASN1Primitive inner = in.readObject();
+                if (inner instanceof org.bouncycastle.asn1.ASN1Sequence) {
+                    final org.bouncycastle.asn1.ASN1Encodable first =
+                            ((org.bouncycastle.asn1.ASN1Sequence) inner).getObjectAt(0);
+                    if (first instanceof org.bouncycastle.asn1.ASN1Sequence) {
+                        try {
+                            Certificate.getInstance(first);
+                            return "CMPCertificate[]";
+                        } catch (final Exception ignored) {
+                            // not a certificate sequence
+                        }
+                    }
+                }
+                return "SKI/raw(" + inner.getClass().getSimpleName() + ")";
+            }
+        } catch (final Exception ex) {
+            return "raw-bytes";
+        }
+    }
+
+    /** Unwrap the DERBitString/OCTET STRING wrapper of a senderKID to its payload. */
+    private static byte[] rawKidBytes(final org.bouncycastle.asn1.ASN1Encodable kid)
+            throws java.io.IOException {
+        final ASN1Primitive p = kid.toASN1Primitive();
+        if (p instanceof DERBitString) {
+            return ((DERBitString) p).getBytes();
+        }
+        if (p instanceof ASN1OctetString) {
+            return ((ASN1OctetString) p).getOctets();
+        }
+        return p.getEncoded(ASN1Encoding.DER);
+    }
+
+    private static String asn1Hex(final org.bouncycastle.asn1.ASN1Encodable encodable) {
+        if (encodable == null) {
+            return "none";
+        }
+        try {
+            final byte[] bytes = rawKidBytes(encodable);
+            final HexFormat hex = HexFormat.of();
+            return bytes.length > 64
+                    ? hex.formatHex(Arrays.copyOf(bytes, 64)) + "... (" + bytes.length + " B)"
+                    : hex.formatHex(bytes);
+        } catch (final Exception ex) {
+            return "<unencodable>";
+        }
+    }
+
+        /**
+     * Subject/issuer/serial/key-alg/validity of the certificate granted inside a
+     * CertRep body (first CertResponse), for DEBUG-level comparison with the
+     * client-side enrollment chain build. Uses X509Certificate via CertUtility
+     * because BC's ASN.1 Certificate has no convenience getters.
+     */
+    private static String describeCertBody(final PKIMessage message) {
+        try {
+            final Object content = message.getBody().getContent();
+            org.bouncycastle.asn1.cmp.CertResponse[] responses = null;
+            if (content instanceof CertRepMessage) {
+                responses = ((CertRepMessage) content).getResponse();
+            }
+            if (responses == null || responses.length == 0
+                    || responses[0].getCertifiedKeyPair() == null
+                    || responses[0].getCertifiedKeyPair().getCertOrEncCert() == null) {
+                return "no issued certificate in body";
+            }
+            final X509Certificate x = CertUtility.asX509Certificate(
+                    responses[0].getCertifiedKeyPair().getCertOrEncCert().getCertificate());
+            return "subject=" + x.getSubjectX500Principal()
+                    + ", issuer=" + x.getIssuerX500Principal()
+                    + ", serial=" + x.getSerialNumber()
+                    + ", sigAlg=" + x.getSigAlgName()
+                    + " (" + x.getSigAlgOID() + ")"
+                    + ", notBefore=" + x.getNotBefore()
+                    + ", notAfter=" + x.getNotAfter()
+                    + ", pubKey=" + x.getPublicKey().getAlgorithm()
+                    + "/" + (x.getPublicKey() instanceof java.security.interfaces.RSAPublicKey
+                            ? ((java.security.interfaces.RSAPublicKey) x.getPublicKey())
+                                    .getModulus().bitLength() + " bit"
+                            : "see key")
+                    + ", derLen=" + x.getEncoded().length + " B"
+                    + ", criticalBC=" + (x.getBasicConstraints() >= 0
+                            ? "CA,pathlen=" + x.getBasicConstraints() : "leaf");
+        } catch (final Exception ex) {
+            return "<unavailable: " + ex.getMessage() + ">";
+        }
+    }
+
+    private static byte[] safeEncode(final PKIMessage message) {
+        try {
+            return message.getEncoded(ASN1Encoding.DER);
+        } catch (final Exception ex) {
+            return null;
         }
     }
 
