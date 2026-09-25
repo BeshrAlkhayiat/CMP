@@ -271,6 +271,9 @@ public class GatewayConfig implements Configuration {
      */
     private final ThreadLocal<Boolean> selfGeneratedUpstreamMessage = new ThreadLocal<>();
 
+    /** Count of validation queries for diagnosing flag/thread mismatches. */
+    private int trustedCertsQueries;
+
     public boolean isProcessingSelfGeneratedUpstreamMessage() {
         return Boolean.TRUE.equals(selfGeneratedUpstreamMessage.get());
     }
@@ -558,9 +561,24 @@ public class GatewayConfig implements Configuration {
                         //     non-empty".
                         java.util.Set<List<X509Certificate>> anchorSources = new java.util.LinkedHashSet<>();
                         anchorSources.add(getAutomaticallyFetchedCaChain());
+                        // INFO on purpose: if this ever shows selfGenerated=false while the
+                        // gateway is answering a signature-protected request, the merge
+                        // below is skipped and the RA rejects with "validating the
+                        // protection certificate failed" (thread-boundary problem).
+                        LOG.info("upstream trust anchor query #{}: self-generated response in "
+                                        + "progress={} (thread {})",
+                                ++trustedCertsQueries,
+                                isProcessingSelfGeneratedUpstreamMessage(),
+                                Thread.currentThread().getName());
                         if (isProcessingSelfGeneratedUpstreamMessage()) {
                             try {
-                                anchorSources.add(getCertificateChain());
+                                List<X509Certificate> keystoreChain = getCertificateChain();
+                                LOG.info("merging gateway keystore chain into trust anchors: {}",
+                                        keystoreChain == null ? "not available"
+                                                : keystoreChain.stream()
+                                                        .map(c -> c.getSubjectX500Principal().getName())
+                                                        .collect(java.util.stream.Collectors.toList()));
+                                anchorSources.add(keystoreChain);
                             } catch (Exception e) {
                                 LOG.warn("upstream verification: could not load gateway keystore "
                                         + "certificate chain as trust anchors", e);
@@ -585,10 +603,12 @@ public class GatewayConfig implements Configuration {
                                     + "truststore)", trusted.size());
                         }
                         if (!trusted.isEmpty()) {
-                            LOG.debug("upstream verification: validating protection certificates "
-                                    + "against {} trust anchor(s) (CA chain, gateway keystore "
-                                    + "chain and/or truststore)",
-                                    trusted.size());
+                            LOG.info("upstream verification: validating protection certificate "
+                                    + "against {} trust anchor(s): {}",
+                                    trusted.size(),
+                                    trusted.stream()
+                                            .map(c -> c.getSubjectX500Principal().getName())
+                                            .collect(java.util.stream.Collectors.toList()));
                             return trusted;
                         }
                         LOG.debug("upstream verification: no trust anchors available "

@@ -172,15 +172,21 @@ public final class CmpGateway {
         public byte[] sendReceiveMessage(
                 final byte[] request, final String certProfile, final int bodyType) throws Exception {
             final PKIMessage message = parseMessage(request);
+            // INFO level on purpose: this shows which protection the incoming EE
+            // request actually carries - the single most important diagnostic for
+            // the "validating the protection certificate failed" issue.
+            LOG.info("upstream callback: body type {}, sender='{}', protection={}, extraCerts={}",
+                    bodyType,
+                    message.getHeader().getSender() == null
+                            ? null : message.getHeader().getSender().getName(),
+                    protectionAlgorithmName(message.getHeader()),
+                    message.getExtraCerts() == null ? 0 : message.getExtraCerts().length);
             if (LOG.isDebugEnabled()) {
-                LOG.debug("upstream request received by gateway callback: LCMP body type {}, senderNID='{}', "
-                                + "protection algorithm '{}', extraCerts count {}",
-                        bodyType,
-                        message.getHeader().getSender() == null
-                                ? null : message.getHeader().getSender().getName(),
-                        message.getHeader().getProtectionAlg() == null
-                                ? "none" : message.getHeader().getProtectionAlg().getAlgorithm().getId(),
-                        message.getExtraCerts() == null ? 0 : message.getExtraCerts().length);
+                LOG.debug("upstream callback: senderKID form {}",
+                        message.getHeader().getSenderKID() == null
+                                ? "none"
+                                : message.getHeader().getSenderKID()
+                                        .toASN1Primitive().getClass().getSimpleName());
             }
             // Remember the transaction of the request being processed so that the
             // generated upstream responses can be protected with the matching
@@ -631,6 +637,11 @@ public final class CmpGateway {
                 // trust anchors; GatewayConfig.getUpstreamConfiguration()
                 // merges the gateway keystore chain into those anchors while a
                 // self-generated message is being validated, so it passes.
+                final X509Certificate signer = getGatewaySignerCertificate();
+                LOG.info("protecting self-generated upstream response with the gateway "
+                                + "signature credential: subject='{}', issuer='{}'",
+                        signer == null ? "<not available>" : signer.getSubjectX500Principal(),
+                        signer == null ? "<not available>" : signer.getIssuerX500Principal());
                 protector = new MsgOutputProtector(
                         upstreamConfig,
                         StreamType.upstream(UPSTREAM_INTERFACE_NAME),
