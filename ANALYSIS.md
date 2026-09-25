@@ -204,3 +204,29 @@ CliCmpClient defensive fix kept as belt-and-braces (correct PKCS#12 chains need 
 
 ### Build status
 javac over all cmp-gateway sources vs CmpRaComponent-4.3.0.jar: exit 0.
+
+## 11. Root cause of the client-side NPE (FINAL, verified against LCMP reference source)
+
+Symptom: gateway log clean (granted=0, all validations pass), but
+`CliCmpClient --enroll ...` -> `NullPointerException: Cannot read the array length because "certs" is null`.
+
+Verified chain in the UNMODIFIED reference code:
+- `LightweightCmpRa/.../main/CliCmpClient.java` doEnrollment(): when `--enrollmentKeystore`
+  (+password) is given AND a private key is available, it calls
+  `ret.getEnrollmentChain().toArray(...)` with NO null check -> NPE on null.
+- `cmpclientcomponent/main/CmpClient.invokeEnrollment()`: `enrollmentChain` is set to
+  `null` whenever `enrollmentContext.getEnrollmentTrust() == null` (by design; the CLI
+  then simply has no chain material to write).
+- Gateway side is RFC-correct: extraCerts carry signer chain + CA chain (log line
+  "appended 2 CA certificate(s) ..."), and the issued EE cert validates against the
+  CEMA anchors ("enrollment verification ... 2 trust anchor(s)" with no warning).
+
+FIX = configuration, not code: add `trustedCertificates:` under `EnrollmentTrust:` in
+`gateway-p10-pbm.yaml` (CEMA_Root_CA.cer, optionally CEMA_User_CA.cer). Then the client
+builds the enrollment chain from CertRep extraCerts via PKIX and passes a non-null
+[leaf, CA...] array to CredentialWriter.writeKeystore.
+
+LCMP Java sources remain byte-identical to the vendored reference (git diff empty).
+Gateway compiles clean (javac exit 0). No new gateway code change was required for this
+NPE; earlier fixes (trust-anchor merge flag, CA chain in extraCerts, senderKID form)
+stand as committed (ddd54b6, 7501706, 0f8f40e).
