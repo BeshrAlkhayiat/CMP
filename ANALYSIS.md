@@ -243,3 +243,27 @@ LCMP Java sources remain byte-identical to the vendored reference (git diff empt
 Gateway compiles clean (javac exit 0). No new gateway code change was required for this
 NPE; earlier fixes (trust-anchor merge flag, CA chain in extraCerts, senderKID form)
 stand as committed (ddd54b6, 7501706, 0f8f40e).
+
+## 12. Final root cause of the client NPE (verified in RA sources, this turn)
+
+The gateway's CertRep now passes all server-side validation (see last live log:
+granted=0, no warnings). The remaining client failure
+`NullPointerException: "certs" is null` traces to:
+
+- CmpClient.invokeEnrollment(): enrollmentChain = TrustCredentialAdapter.validateCertAgainstTrust(
+      issued cert, asX509Certificates(response.extraCerts)) -> returns null on ANY CertPathBuilderException.
+- TrustCredentialAdapter filters path-building material: only certs that pass
+  CertUtility.isIntermediateCertificate() AND BC X509CertificateHolder.isCA()
+  (i.e. critical BasicConstraints cA=true) are usable as intermediates.
+- If the CEMA User CA certificate delivered by `GET /ca/CEMA-User-CA/chain` lacks a
+  critical BasicConstraints cA=true extension (typical when exported/re-encoded by the
+  REST layer), PKIX cannot use it -> chain build fails -> null -> NPE at CliCmpClient line 278.
+- Gateway side identical for RaDownstream.processCertResponse ("could not validate trust
+  chain of issued certificate" in earlier run - same mechanism, same suspect cert).
+
+Diagnostic added: describeExtraCerts() now logs per-cert [BC=..., KU=...] for every
+extraCert of the self-generated response. Rerun and check the "self-generated upstream
+response ready" line:
+- CN=CEMA User CA shows BC=critical,pathLen=N -> hypothesis wrong, look elsewhere.
+- CN=CEMA User CA shows BC=none/leaf or non-critical -> CONFIRMED: fix by exporting the
+  proper DER CA cert into the gateway truststore / fixing the REST chain endpoint.

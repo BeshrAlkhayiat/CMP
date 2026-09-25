@@ -775,9 +775,26 @@ public final class CmpGateway {
                     if (sb.length() > 0) {
                         sb.append(", ");
                     }
+                    // Diagnostic detail: the RA component's TrustCredentialAdapter drops
+                    // every extraCert that is not marked as a CA certificate (BasicConstraints
+                    // cA=true, see CertUtility.isIntermediateCertificate / BC's
+                    // X509CertificateHolder.isCA) when collecting path-building material, and
+                    // JDK PKIX ignores non-CA candidates entirely. A cert with a missing or
+                    // non-critical BasicConstraints extension therefore silently breaks chain
+                    // building even though subject/issuer names look perfect - which is exactly
+                    // what "error building enrollment chain" (client) / "could not validate
+                    // trust chain of issued certificate" (RA downstream) looked like here.
                     sb.append(x.getSubjectX500Principal().getName())
                             .append(" <- ")
                             .append(x.getIssuerX500Principal().getName());
+                    try {
+                        final int bc = x.getBasicConstraints();
+                        sb.append(" [BC=").append(bc < 0 ? "none/leaf" : ("critical,pathLen=" + bc))
+                                .append(", KU=").append(keyUsageToString(x.getKeyUsage()))
+                                .append("]");
+                    } catch (final Exception ignored) {
+                        // extension parsing is diagnostic only
+                    }
                 } catch (final Exception ex) {
                     if (sb.length() > 0) {
                         sb.append(", ");
@@ -786,6 +803,28 @@ public final class CmpGateway {
                 }
             }
             return sb.toString();
+        }
+
+        /**
+         * Diagnostic helper: render the key usage bits of a certificate compactly.
+         */
+        private static String keyUsageToString(final boolean[] ku) {
+            if (ku == null) {
+                return "none";
+            }
+            final String[] names = {"digitalSignature", "nonRepudiation", "keyEncipherment",
+                    "dataEncipherment", "keyAgreement", "keyCertSign", "cRLSign",
+                    "encipherOnly", "decipherOnly"};
+            final StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < ku.length && i < names.length; i++) {
+                if (ku[i]) {
+                    if (sb.length() > 0) {
+                        sb.append('|');
+                    }
+                    sb.append(names[i]);
+                }
+            }
+            return sb.length() == 0 ? "empty" : sb.toString();
         }
 
         /**
