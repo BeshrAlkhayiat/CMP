@@ -55,6 +55,13 @@ public class GatewayConfig implements Configuration {
     private Integer centralKeySize;
     private String centralKeyCurve;
     private boolean crmfEnabled;
+
+    /**
+     * Cache for the truststore contents: reading the PKCS#12 file on every CMP
+     * message is expensive and produces repeated log noise. Cleared whenever a
+     * new truststore path is configured.
+     */
+    private List<X509Certificate> cachedTrustedCertificates;
     
     public GatewayConfig() {
         // Defaults
@@ -100,7 +107,10 @@ public class GatewayConfig implements Configuration {
     public String getKeyAlias() { return keyAlias; }
     public void setKeyAlias(String keyAlias) { this.keyAlias = keyAlias; }
     public String getTruststorePath() { return truststorePath; }
-    public void setTruststorePath(String truststorePath) { this.truststorePath = truststorePath; }
+    public void setTruststorePath(String truststorePath) {
+        this.truststorePath = truststorePath;
+        this.cachedTrustedCertificates = null; // invalidate cache on reconfiguration
+    }
     public String getTruststorePassword() { return truststorePassword; }
     public void setTruststorePassword(String truststorePassword) { this.truststorePassword = truststorePassword; }
     public String getTruststoreType() { return truststoreType; }
@@ -167,7 +177,12 @@ public class GatewayConfig implements Configuration {
      * responses signed by the CA). Returns an empty list if no truststore is configured.
      */
     public List<X509Certificate> getTrustedCertificatesFromTrustStore() {
+        if (cachedTrustedCertificates != null) {
+            return cachedTrustedCertificates;
+        }
         if (truststorePath == null || truststorePath.isEmpty()) {
+            LOG.debug("no truststore configured (auth.truststore.path is empty); "
+                    + "upstream protection-certificate path validation will be skipped");
             return Collections.emptyList();
         }
         try {
@@ -197,6 +212,13 @@ public class GatewayConfig implements Configuration {
             }
             LOG.info("Loaded " + result.size() + " trusted certificate(s) from truststore '"
                     + truststorePath + "'");
+            for (X509Certificate cert : result) {
+                LOG.debug("trust anchor: subject='" + cert.getSubjectX500Principal()
+                        + "', issuer='" + cert.getIssuerX500Principal()
+                        + "', notBefore=" + cert.getNotBefore()
+                        + ", notAfter=" + cert.getNotAfter());
+            }
+            cachedTrustedCertificates = result;
             return result;
         } catch (Exception e) {
             LOG.warn("could not load truststore '" + truststorePath + "' for CMP protection validation", e);
@@ -434,7 +456,38 @@ public class GatewayConfig implements Configuration {
                         // rather than an empty list, which fails with
                         // "the trustAnchors parameter must be non-empty".
                         List<X509Certificate> trusted = getTrustedCertificatesFromTrustStore();
-                        return trusted.isEmpty() ? null : trusted;
+                        if (trusted.isEmpty()) {
+                            LOG.debug("upstream verification: no trust anchors configured, "
+                                    + "skipping protection-certificate path validation");
+                            return null;
+                        }
+                        LOG.debug("upstream verification: validating protection certificates "
+                                + "against {} trust anchor(s)", trusted.size());
+                        return trusted;
+                    }
+
+                    @Override
+                    public Collection<X509Certificate> getAdditionalCerts() {
+                        // The gateway signs its self-generated upstream CertReps with its
+                        // own client certificate. When that certificate is not published in
+                        // the truststore (e.g. issued by a different CA), supply its issuing
+                        // chain here so PKIX path building can still build a valid chain to
+                        // a configured trust anchor. Without this, validation fails with
+                        // "validating the protection certificate failed" (signerNotTrusted).
+                        try {
+                            List<X509Certificate> chain = getCertificateChain();
+                            if (chain.size() > 1) {
+                                // Everything above the leaf acts as intermediate material.
+                                LOG.debug("upstream verification: supplying {} additional CA "
+                                        + "certificate(s) from the gateway keystore for path "
+                                        + "building", chain.size() - 1);
+                                return chain.subList(1, chain.size());
+                            }
+                        } catch (Exception e) {
+                            LOG.warn("upstream verification: could not load gateway certificate "
+                                    + "chain for additional path-building material", e);
+                        }
+                        return VerificationContext.super.getAdditionalCerts();
                     }
                 };
             }

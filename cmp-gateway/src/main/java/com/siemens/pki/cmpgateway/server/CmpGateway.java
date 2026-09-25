@@ -142,6 +142,16 @@ public final class CmpGateway {
         public byte[] sendReceiveMessage(
                 final byte[] request, final String certProfile, final int bodyType) throws Exception {
             final PKIMessage message = parseMessage(request);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("upstream request received by gateway callback: LCMP body type {}, senderNID='{}', "
+                                + "protection algorithm '{}', extraCerts count {}",
+                        bodyType,
+                        message.getHeader().getSender() == null
+                                ? null : message.getHeader().getSender().getName(),
+                        message.getHeader().getProtectionAlg() == null
+                                ? "none" : message.getHeader().getProtectionAlg().getAlgorithm().getId(),
+                        message.getExtraCerts() == null ? 0 : message.getExtraCerts().length);
+            }
             // Remember the transaction of the request being processed so that the
             // generated upstream responses can be protected with the matching
             // credentials (see protectUpstreamResponse).
@@ -529,6 +539,11 @@ public final class CmpGateway {
                 throws Exception {
             final CmpMessageInterface upstreamConfig = config.getUpstreamConfiguration(
                     persistencyContext.getCertProfile(), responseBody.getType());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("protecting generated upstream response (body type {}); incoming request is "
+                                + "protected with {}",
+                        responseBody.getType(), protectionAlgorithmName(request.getHeader()));
+            }
             final CredentialContext reusedCredentials = buildReusedCredentialContext(request);
             final MsgOutputProtector protector;
             if (reusedCredentials instanceof SharedSecretCredentialContext) {
@@ -572,6 +587,24 @@ public final class CmpGateway {
                         (MessageContext) null);
             }
             return protector.generateAndProtectResponseTo(request, responseBody);
+        }
+
+        /**
+         * Human-readable name of the protection algorithm in a PKI header, for logging.
+         */
+        private static String protectionAlgorithmName(final org.bouncycastle.asn1.cmp.PKIHeader header) {
+            final org.bouncycastle.asn1.x509.AlgorithmIdentifier alg = header.getProtectionAlg();
+            if (alg == null) {
+                return "none";
+            }
+            final String oid = alg.getAlgorithm().getId();
+            if (org.bouncycastle.asn1.cmp.CMPObjectIdentifiers.passwordBasedMac.equals(alg.getAlgorithm())) {
+                return "PasswordBasedMac (" + oid + ")";
+            }
+            if (org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.id_PBMAC1.equals(alg.getAlgorithm())) {
+                return "PBMAC1 (" + oid + ")";
+            }
+            return "signature (" + oid + ")";
         }
 
         /**
@@ -649,15 +682,14 @@ public final class CmpGateway {
                 return null;
             }
             // Signature-based (or unknown) protection: respond with the
-            // configured upstream output credentials. Echo the senderKID so
-            // clients that look up our certificate by key identifier succeed.
-            final ASN1OctetString senderKid = header.getSenderKID();
-            return new CredentialContext() {
-                @SuppressWarnings("unused")
-                public byte[] getSenderKID() {
-                    return senderKid == null ? null : senderKid.getOctets();
-                }
-            };
+            // configured upstream output credentials. The gateway certificate is
+            // embedded in extraCerts by MsgOutputProtector, so clients that look
+            // up our signer certificate by key identifier do not need a
+            // senderKID echo here.
+            LOG.debug("request is protected with {}; answering with the configured upstream "
+                    + "output credentials (gateway certificate)",
+                    protectionAlgorithmName(header));
+            return null;
         }
 
         /**
