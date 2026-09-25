@@ -664,8 +664,18 @@ public final class CmpGateway {
                         StreamType.upstream(UPSTREAM_INTERFACE_NAME),
                         (MessageContext) null);
             }
-            final PKIMessage protectedResponse =
-                    protector.generateAndProtectResponseTo(request, responseBody);
+            final PKIMessage generated = protector.generateAndProtectResponseTo(request, responseBody);
+            // RFC 4210 section 5.1.3.1.3 / RFC 9483 section 3.2: a CMP server MUST
+            // send all issuer-side certificates needed to build a certification path
+            // for the issued certificate in the extraCerts field of the CertRep (the
+            // CA certificates are normally sent with every response). The LCMP client
+            // stack builds its enrollment chain exclusively from these extraCerts
+            // (see CmpClient.invokeEnrollment -> TrustCredentialAdapter.
+            // validateCertAgainstTrust(issued cert, asX509Certificates(extraCerts))),
+            // so without them getEnrollmentChain() comes back null and enrollment
+            // fails client-side. MsgOutputProtector only embeds the signer's own
+            // chain here, so append the CA chain fetched via GET /ca/{caName}/chain.
+            final PKIMessage protectedResponse = appendCaChainExtraCerts(generated);
             // Diagnostic: what the RA downstream stage will see when it validates the
             // trust chain of the ISSUED certificate - its only path-building material
             // is the extraCerts list of this message (RaDownstream.processCertResponse
@@ -791,6 +801,69 @@ public final class CmpGateway {
             final ASN1ObjectIdentifier oid = protectionAlg.getAlgorithm();
             return !org.bouncycastle.asn1.cmp.CMPObjectIdentifiers.passwordBasedMac.equals(oid)
                     && !org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.id_PBMAC1.equals(oid);
+        }
+
+        /**
+         * Append the CA chain (fetched via GET /ca/{caName}/chain) to the extraCerts
+         * of a self-generated CertRep, as required by RFC 4210 section 5.1.3.1.3 and
+         * RFC 9483 section 3.2: the server must deliver all certificates needed to
+         * build a certification path for the issued certificate with every response.
+         * LCMP clients have no other source for these issuer-side certificates -
+         * without them getEnrollmentChain() returns null on the client side.
+         */
+        private PKIMessage appendCaChainExtraCerts(final PKIMessage message) {
+            try {
+                final List<X509Certificate> caChain = config.getAutomaticallyFetchedCaChain();
+                if (caChain == null || caChain.isEmpty()) {
+                    return message;
+                }
+                final org.bouncycastle.asn1.cmp.CMPCertificate[] old =
+                        message.getExtraCerts() == null
+                                ? new org.bouncycastle.asn1.cmp.CMPCertificate[0]
+                                : message.getExtraCerts();
+                final java.util.List<org.bouncycastle.asn1.cmp.CMPCertificate> merged =
+                        new ArrayList<>(Arrays.asList(old));
+                int added = 0;
+                for (final X509Certificate cert : caChain) {
+                    final org.bouncycastle.asn1.cmp.CMPCertificate cmpCert =
+                            org.bouncycastle.asn1.cmp.CMPCertificate.getInstance(
+                                    cert.getEncoded());
+                    // Skip duplicates (e.g. gateway signer chain already embedded by
+                    // MsgOutputProtector, or a CA cert that is also a trust anchor).
+                    if (!containsEncoded(merged, cmpCert)) {
+                        merged.add(cmpCert);
+                        added++;
+                    }
+                }
+                if (added == 0) {
+                    return message;
+                }
+                LOG.info("appended {} CA certificate(s) from '{}' to the extraCerts of the "
+                                + "self-generated upstream response (RFC 4210 5.1.3.1.3)",
+                        added, "GET /ca/" + config.getCaName() + "/chain");
+                return new PKIMessage(message.getHeader(), message.getBody(),
+                        message.getProtection(),
+                        merged.toArray(new org.bouncycastle.asn1.cmp.CMPCertificate[0]));
+            } catch (final Exception ex) {
+                // Never fail the enrollment because of the convenience chain; the
+                // client may still hold the CA certificates itself.
+                LOG.warn("could not append the CA chain to the extraCerts of the "
+                        + "self-generated upstream response", ex);
+                return message;
+            }
+        }
+
+        private static boolean containsEncoded(
+                final java.util.List<org.bouncycastle.asn1.cmp.CMPCertificate> list,
+                final org.bouncycastle.asn1.cmp.CMPCertificate candidate)
+                throws java.io.IOException {
+            final byte[] encoded = candidate.getEncoded(ASN1Encoding.DER);
+            for (final org.bouncycastle.asn1.cmp.CMPCertificate existing : list) {
+                if (Arrays.equals(existing.getEncoded(ASN1Encoding.DER), encoded)) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         /**

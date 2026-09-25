@@ -140,3 +140,35 @@ Log analysis:
 - Cause B (fixed): getCertificateChain() returned EMPTY if auth.keystore.alias does not match the p12 key entry or if the entry stores only the leaf (typical Tomcat-exported p12). Now: alias falls back to the first key entry; leaf-only entries get their issuing chain rebuilt from other keystore entries; loud WARNs otherwise.
 
 Remaining hard requirement: PKIX needs a path from the gateway signer cert to an anchor. If the p12/keystore contains ONLY the Tomcat leaf, the BoarderZone Dev CA must be added to auth.truststore.path - the new WARN log says exactly this. Long-term correct design (per user): CMP signer should be a cert under the CEMA PKI (same chain the API returns via GET /ca/CEMA-User-CA/chain); the Tomcat cert is for REST/TLS auth only.
+
+## 2026-09-25 (later): RFC 9483 compliance review - gateway was missing extraCerts CA chain
+
+User challenged the "LCMP client bug" conclusion since LCMP is the reference implementation.
+Verified against the actual client source (cmp-ra-component/src/main/java/com/siemens/pki/
+cmpclientcomponent/main/CmpClient.java, invokeEnrollment ~line 576):
+
+```java
+if (enrollmentContext.getEnrollmentTrust() != null) {
+    enrollmentChain = validateCertAgainstTrust(enrolledCert, asX509Certificates(responseMessage.getExtraCerts()));
+} else {
+    enrollmentChain = null;   // <-- null by design when client has no enrollment trust configured
+}
+```
+
+=> getEnrollmentChain() returning null is NORMAL for a client without EnrollmentTrust. The
+NullPointerException in CliCmpClient.writeKeystore(null-chain) is therefore only a robustness
+gap in the test CLI, but the REAL standards issue is on our side:
+
+RFC 4210 sec. 5.1.3.1.3 / RFC 9483 sec. 3.2: a CMP server MUST include all issuer-side
+certificates needed to build a certification path for the issued certificate in extraCerts of
+every CertRep. Our self-generated CertRep carried only the gateway signer chain
+(CN=CEMA Admin <- BoarderZone Dev CA) and NOT the CEMA User CA / Root CA chain that actually
+issued the enrolled certificate. A conformant client with pinned trust anchors could not have
+built the path either.
+
+Fix: CmpGateway.RestUpstream.appendCaChainExtraCerts() appends the CA chain fetched via
+GET /ca/{caName}/chain (deduplicated by DER encoding) to the extraCerts of every
+self-generated upstream response, before RA validation and before sending downstream.
+After this fix the LCMP client also gets a non-null enrollment chain even without its own
+EnrollmentTrust config, so the keystore write works with unmodified reference code.
+CliCmpClient defensive fix kept as belt-and-braces (correct PKCS#12 chains need the leaf first).
