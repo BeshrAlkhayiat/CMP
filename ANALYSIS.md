@@ -221,10 +221,23 @@ Verified chain in the UNMODIFIED reference code:
   "appended 2 CA certificate(s) ..."), and the issued EE cert validates against the
   CEMA anchors ("enrollment verification ... 2 trust anchor(s)" with no warning).
 
-FIX = configuration, not code: add `trustedCertificates:` under `EnrollmentTrust:` in
-`gateway-p10-pbm.yaml` (CEMA_Root_CA.cer, optionally CEMA_User_CA.cer). Then the client
-builds the enrollment chain from CertRep extraCerts via PKIX and passes a non-null
-[leaf, CA...] array to CredentialWriter.writeKeystore.
+CORRECTION after re-verification: `gateway-p10-pbm.yaml` ALREADY contains
+`EnrollmentTrust.trustedCertificates` (CEMA_Root_CA.cer), so that was NOT the cause.
+
+Actual trigger (verified by reading CliCmpClient.doEnrollment + CredentialWriter):
+the NPE happens only when the LCMP invocation includes `--enrollmentKeystore` with a
+password AND an accessible private key; the reference CLI then calls
+`ret.getEnrollmentChain().toArray(...)` without a null guard. getEnrollmentChain() is
+null whenever the client-side PKIX path build over the CertRep extraCerts fails or the
+client lacks the local material for it (e.g. running against a p10 whose key/cert paths
+are Windows-only file:// URIs). The gateway response itself is RFC-correct and complete.
+
+RESOLUTION options (no reference-code change needed):
+1. Test command WITHOUT --enrollmentKeystore/--enrollmentKeystorePassword -> cert+key
+   are still written to the --enroll output file; no NPE possible.
+2. If a keystore is required, ensure the yaml's CertificationRequest key matches the
+   p10's public key and all file:// paths exist on the machine, so the client-side
+   chain build succeeds and returns a non-null [CA...] list.
 
 LCMP Java sources remain byte-identical to the vendored reference (git diff empty).
 Gateway compiles clean (javac exit 0). No new gateway code change was required for this
