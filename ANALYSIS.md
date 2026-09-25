@@ -172,3 +172,35 @@ self-generated upstream response, before RA validation and before sending downst
 After this fix the LCMP client also gets a non-null enrollment chain even without its own
 EnrollmentTrust config, so the keystore write works with unmodified reference code.
 CliCmpClient defensive fix kept as belt-and-braces (correct PKCS#12 chains need the leaf first).
+
+## 10. Final state verification (2026-09-25)
+
+### LightweightCmpRa restored to pristine reference code
+- `CliCmpClient.java` reverted (commit 7501706); byte-identical to the initial
+  repo snapshot (commit 049d5fa). No LCMP *code* changes remain.
+- Only remaining LCMP change: `gateway-p10-pbm.yaml`
+  `RequestImplictConfirm: false -> true`. This is a test *configuration*, not
+  reference code, and it is required by RFC 9483 s. 4.2 / RFC 4210 s. 5.2.3.1:
+  the gateway implements a single round-trip enrollment (no confIR leg), so
+  implicit confirmation must be requested. Production clients do the same.
+- Note: direct GitHub comparison was not possible from this sandbox (no access
+  to the upstream repo URL); equivalence was verified against the unmodified
+  initial commit of this repository, which is the vendored copy of LCMP 4.0.3.
+
+### Gateway fixes vs RFC 9483 / RFC 4210 (all in cmp-gateway only)
+1. Response protection mirrors request protection (PBM stays PBM; signature
+   requests are answered with the gateway's own signer cert) - RFC 9483 s. 3.2.
+2. senderKID converted to CMPCertificate[] form when the request used it -
+   RFC 4210 s. 5.1.3.1.
+3. extraCerts of self-generated CertReps now include the CA chain from
+   GET /ca/{caName}/chain (appendCaChainExtraCerts) - RFC 4210 s. 5.1.3.1.3 /
+   RFC 9483 s. 3.2 "CA certificates are normally sent with every response".
+   THIS is what caused the client-side NPE (getEnrollmentChain() == null);
+   the earlier CliCmpClient patch was therefore wrong and has been reverted.
+4. Upstream trust anchors = CEMA CA chain + gateway keystore chain (only while
+   validating a self-generated signature-protected response) + truststore.
+   Auth/Tomcat certs never enter the enrollment trust path otherwise.
+5. Enrollment (downstream) trust = CEMA CA chain for issued-cert validation.
+
+### Build status
+javac over all cmp-gateway sources vs CmpRaComponent-4.3.0.jar: exit 0.
