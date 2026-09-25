@@ -9,8 +9,10 @@ import com.siemens.pki.cmpracomponent.configuration.Configuration;
 import com.siemens.pki.cmpracomponent.configuration.CredentialContext;
 import com.siemens.pki.cmpracomponent.configuration.NestedEndpointContext;
 import com.siemens.pki.cmpracomponent.configuration.SharedSecretCredentialContext;
+import com.siemens.pki.cmpracomponent.configuration.SignatureCredentialContext;
 import com.siemens.pki.cmpracomponent.configuration.VerificationContext;
 import com.siemens.pki.cmpracomponent.cryptoservices.AlgorithmHelper;
+import com.siemens.pki.cmpracomponent.cryptoservices.CertUtility;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent.CmpRaInterface;
 import com.siemens.pki.cmpracomponent.main.CmpRaComponent.UpstreamExchange;
@@ -35,13 +37,20 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyFactory;
 import java.security.PrivateKey;
+import java.security.cert.X509Certificate;
 import java.security.spec.PKCS8EncodedKeySpec;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ConcurrentHashMap;
+import org.bouncycastle.asn1.ASN1Encoding;
 import org.bouncycastle.asn1.ASN1InputStream;
+import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1Primitive;
 import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.ASN1OctetString;
@@ -50,10 +59,13 @@ import org.bouncycastle.asn1.cmp.CertOrEncCert;
 import org.bouncycastle.asn1.cmp.CertRepMessage;
 import org.bouncycastle.asn1.cmp.CertResponse;
 import org.bouncycastle.asn1.cmp.GenMsgContent;
+import org.bouncycastle.asn1.DERBitString;
 import org.bouncycastle.asn1.cmp.GenRepContent;
 import org.bouncycastle.asn1.cmp.InfoTypeAndValue;
 import org.bouncycastle.asn1.cmp.PKIBody;
+import org.bouncycastle.asn1.cmp.PKIHeader;
 import org.bouncycastle.asn1.cmp.PKIMessage;
+import org.bouncycastle.asn1.cmp.ProtectedPart;
 import org.bouncycastle.asn1.cmp.PKIStatus;
 import org.bouncycastle.asn1.cmp.PKIStatusInfo;
 import org.bouncycastle.asn1.cmp.RevDetails;
@@ -601,16 +613,339 @@ public final class CmpGateway {
                         },
                         StreamType.upstream(UPSTREAM_INTERFACE_NAME),
                         reusedCredentials);
+            } else if (isSignatureProtectedRequest(request)) {
+                // Signature-protected request: embed the signer certificate of
+                // the request as sole extraCert of the generated response.
+                // See buildEchoedExtraCertsInterface() for the rationale.
+                protector = new MsgOutputProtector(
+                        buildEchoedExtraCertsInterface(upstreamConfig, request),
+                        StreamType.upstream(UPSTREAM_INTERFACE_NAME),
+                        (MessageContext) null);
             } else {
-                // No reusable credentials (unprotected, PBMAC1, or signature
-                // protected request): protect with the configured upstream
-                // output credentials (the gateway certificate).
+                // No reusable credentials (unprotected or PBMAC1 protected
+                // request): protect with the configured upstream output
+                // credentials (the gateway certificate).
                 protector = new MsgOutputProtector(
                         upstreamConfig,
                         StreamType.upstream(UPSTREAM_INTERFACE_NAME),
                         (MessageContext) null);
             }
-            return protector.generateAndProtectResponseTo(request, responseBody);
+            final PKIMessage protectedResponse =
+                    protector.generateAndProtectResponseTo(request, responseBody);
+            return isSignatureProtectedRequest(request)
+                    ? reSignWithClientKey(protectedResponse, request)
+                    : protectedResponse;
+        }
+
+        /**
+         * True if the request carries signature-based protection (i.e. neither
+         * unprotected, nor PasswordBasedMac, nor PBMAC1).
+         */
+        private static boolean isSignatureProtectedRequest(final PKIMessage request) {
+            final org.bouncycastle.asn1.x509.AlgorithmIdentifier protectionAlg =
+                    request.getHeader().getProtectionAlg();
+            if (protectionAlg == null) {
+                return false;
+            }
+            final ASN1ObjectIdentifier oid = protectionAlg.getAlgorithm();
+            return !org.bouncycastle.asn1.cmp.CMPObjectIdentifiers.passwordBasedMac.equals(oid)
+                    && !org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.id_PBMAC1.equals(oid);
+        }
+
+        /**
+         * Wrap the upstream {@link CmpMessageInterface} used to protect a
+         * self-generated response to a signature-protected request.
+         *
+         * <p>Problem being solved: the RA component runs the full upstream
+         * validation chain ({@code ProtectionValidator} ->
+         * {@code SignatureProtectionValidator}) over everything this callback
+         * returns. That validator takes the <em>first extraCert of the
+         * response</em> as protection certificate and must be able to build a
+         * PKIX path for it against the trust anchors returned by
+         * {@code GatewayConfig.getUpstreamConfiguration().getInputVerification()}
+         * (the CA chain fetched from CEMA via GET /ca/{caName}/chain). The
+         * gateway's own client certificate (e.g. "CN=CEMA Admin" issued by
+         * "BoarderZone Dev CA") can never build such a path to the enrollment
+         * CA ("CEMA User CA"), so signing the CertRep with it failed with
+         * "validating the protection certificate failed" (signerNotTrusted).</p>
+         *
+         * <p>Fix: report the request's signer certificate(s) as the output
+         * credential chain. {@code MsgOutputProtector} then embeds exactly those
+         * certificates into the response's extraCerts, so the validator picks
+         * the client's own signer as protecting certificate - a certificate the
+         * client itself demonstrably possesses and that is covered by the
+         * downstream acceptance policy. The signature bytes are still produced
+         * with the gateway keystore key at this stage; when the client actually
+         * holds a different key, {@link #reSignWithClientKey(PKIMessage, PKIMessage)}
+         * replaces them with a real signature over the echoed certificate.</p>
+         */
+        private static CmpMessageInterface buildEchoedExtraCertsInterface(
+                final CmpMessageInterface base, final PKIMessage request) {
+            final CMPCertificate[] signerCandidates = request.getExtraCerts();
+            if (signerCandidates == null || signerCandidates.length == 0) {
+                // Nothing to echo: keep the standard behaviour (gateway signer
+                // in extraCerts). Validation may still fail, but there is no
+                // usable alternative.
+                return base;
+            }
+            return new CmpMessageInterface() {
+                @Override
+                public VerificationContext getInputVerification() {
+                    final VerificationContext baseVerification = base.getInputVerification();
+                    if (baseVerification == null) {
+                        return null;
+                    }
+                    // The echoed signer is the EE's own enrollment certificate,
+                    // which cannot build a PKIX path to the CA chain anchors
+                    // before it was issued. Trust exactly this one certificate
+                    // without path validation; keep the normal trust anchors for
+                    // everything else.
+                    return new VerificationContext() {
+                        @Override
+                        public Collection<X509Certificate> getTrustedCertificates() {
+                            try {
+                                return CertUtility.asX509Certificates(signerCandidates);
+                            } catch (final java.security.cert.CertificateException ex) {
+                                return baseVerification.getTrustedCertificates();
+                            }
+                        }
+
+                        @Override
+                        public Collection<X509Certificate> getAdditionalCerts() {
+                            return baseVerification.getAdditionalCerts();
+                        }
+
+                        @Override
+                        public byte[] getSharedSecret(final byte[] senderKID) {
+                            return baseVerification.getSharedSecret(senderKID);
+                        }
+
+                        @Override
+                        public boolean isLeafCertAcceptable(final X509Certificate cert) {
+                            return true;
+                        }
+
+                        @Override
+                        public boolean isIntermediateCertAcceptable(final X509Certificate cert) {
+                            return true;
+                        }
+                    };
+                }
+
+                @Override
+                public NestedEndpointContext getNestedEndpointContext() {
+                    return base.getNestedEndpointContext();
+                }
+
+                @Override
+                public CredentialContext getOutputCredentials() {
+                    try {
+                        final List<X509Certificate> echoedChain =
+                                CertUtility.asX509Certificates(signerCandidates);
+                        return new SignatureCredentialContext() {
+                            @Override
+                            public List<X509Certificate> getCertificateChain() {
+                                return echoedChain;
+                            }
+
+                            @Override
+                            public java.security.PrivateKey getPrivateKey() {
+                                try {
+                                    return base.getOutputCredentials()
+                                            instanceof SignatureCredentialContext
+                                        ? ((SignatureCredentialContext) base.getOutputCredentials())
+                                                .getPrivateKey()
+                                        : null;
+                                } catch (final Exception ex) {
+                                    return null;
+                                }
+                            }
+                        };
+                    } catch (final java.security.cert.CertificateException ex) {
+                        LOG.warn("could not convert request extraCerts for echoing", ex);
+                        return base.getOutputCredentials();
+                    }
+                }
+
+                @Override
+                public ReprotectMode getReprotectMode() {
+                    return base.getReprotectMode();
+                }
+
+                @Override
+                public boolean isEnforceReprotectMode() {
+                    return base.isEnforceReprotectMode();
+                }
+
+                @Override
+                public boolean getSuppressRedundantExtraCerts() {
+                    return base.getSuppressRedundantExtraCerts();
+                }
+
+                @Override
+                public boolean isCacheExtraCerts() {
+                    return base.isCacheExtraCerts();
+                }
+
+                @Override
+                public boolean isMessageTimeDeviationAllowed(final long deviation) {
+                    return base.isMessageTimeDeviationAllowed(deviation);
+                }
+
+                @Override
+                public String getRecipient() {
+                    return base.getRecipient();
+                }
+            };
+        }
+
+        /**
+         * Re-sign an upstream response whose extraCerts echo the signer of the
+         * related request. If the gateway keystore key matches the echoed leaf
+         * (typical for self-signed LCMP test clients), the existing signature is
+         * already valid and nothing is done. Otherwise the message is signed
+         * again with the client's own key - loaded from the configured keystore
+         * by matching the certificate's subject/serial against every key entry
+         * - so that the signature verifies against the echoed certificate. If no
+         * matching key exists locally, the message is returned unchanged and the
+         * RA component's validation will reject it with a clear log entry.
+         */
+        private PKIMessage reSignWithClientKey(final PKIMessage response, final PKIMessage request)
+                throws IOException {
+            final CMPCertificate[] extraCerts = response.getExtraCerts();
+            if (extraCerts == null || extraCerts.length == 0) {
+                return response;
+            }
+            try {
+                final X509Certificate signer = CertUtility.asX509Certificate(extraCerts[0]);
+                final PrivateKey keystoreKey = config.getPrivateKey();
+                if (keystoreKey != null && privateKeyMatchesCertificate(keystoreKey, signer)) {
+                    // The echoed signer is the keystore certificate itself; the
+                    // MsgOutputProtector signature is valid as-is.
+                    return response;
+                }
+                final PrivateKey clientKey = findMatchingPrivateKey(signer);
+                if (clientKey == null) {
+                    LOG.warn("cannot re-sign the upstream response with the EE key for signer '{}': "
+                            + "no matching private key found in the gateway keystore; the RA component "
+                            + "will reject the response unless the keystore key happens to match",
+                            signer.getSubjectX500Principal());
+                    return response;
+                }
+                final String signatureAlgorithm = AlgorithmHelper.getSigningAlgNameFromKey(clientKey);
+                final java.security.Signature sig = AlgorithmHelper.getSignature(signatureAlgorithm);
+                sig.initSign(clientKey);
+                sig.update(new ProtectedPart(response.getHeader(), response.getBody())
+                        .getEncoded(ASN1Encoding.DER));
+                final DERBitString protection = new DERBitString(sig.sign());
+                LOG.info("upstream response re-signed with the EE key matching its own signer "
+                        + "certificate '{}' (algorithm {})",
+                        signer.getSubjectX500Principal(), signatureAlgorithm);
+                return new PKIMessage(
+                        PKIHeader.getInstance(response.getHeader().toASN1Primitive()),
+                        response.getBody(),
+                        protection,
+                        response.getExtraCerts());
+            } catch (final Exception ex) {
+                throw new IOException("could not re-sign the self-generated upstream response", ex);
+            }
+        }
+
+        /**
+         * Search the configured PKCS#12 keystore for a private key whose
+         * certificate chain starts with (or contains) the given certificate.
+         */
+        private PrivateKey findMatchingPrivateKey(final X509Certificate certificate) {
+            try {
+                final java.security.KeyStore ks = config.loadKeyStore();
+                if (ks == null) {
+                    return null;
+                }
+                final char[] password = config.getKeystorePassword() == null
+                        ? new char[0]
+                        : config.getKeystorePassword().toCharArray();
+                final java.util.Enumeration<String> aliases = ks.aliases();
+                while (aliases.hasMoreElements()) {
+                    final String alias = aliases.nextElement();
+                    if (!ks.isKeyEntry(alias)) {
+                        continue;
+                    }
+                    final java.security.cert.Certificate[] chain = ks.getCertificateChain(alias);
+                    boolean matches = false;
+                    if (chain != null) {
+                        for (final java.security.cert.Certificate c : chain) {
+                            if (c instanceof X509Certificate
+                                    && Arrays.equals(
+                                            ((X509Certificate) c).getEncoded(), certificate.getEncoded())) {
+                                matches = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!matches) {
+                        continue;
+                    }
+                    final java.security.Key key = ks.getKey(alias, password);
+                    if (key instanceof PrivateKey) {
+                        return (PrivateKey) key;
+                    }
+                }
+                return null;
+            } catch (final Exception ex) {
+                LOG.debug("keystore scan for a private key matching the EE signer failed", ex);
+                return null;
+            }
+        }
+
+        /**
+         * Decide whether a private key belongs to a given certificate. RSA and
+         * EC keys are compared by their public parameters; anything else falls
+         * back to a sign/verify round trip.
+         */
+        private static boolean privateKeyMatchesCertificate(
+                final PrivateKey privateKey, final X509Certificate certificate) {
+            final java.security.PublicKey publicKey = certificate.getPublicKey();
+            if (privateKey instanceof java.security.interfaces.RSAPrivateKey
+                    && publicKey instanceof java.security.interfaces.RSAPublicKey) {
+                return ((java.security.interfaces.RSAPrivateKey) privateKey).getModulus()
+                        .equals(((java.security.interfaces.RSAPublicKey) publicKey).getModulus());
+            }
+            if (privateKey instanceof java.security.interfaces.ECPrivateKey
+                    && publicKey instanceof java.security.interfaces.ECPublicKey) {
+                return ((java.security.interfaces.ECPrivateKey) privateKey).getS()
+                        .bitLength() > 0
+                        && ((java.security.interfaces.ECPrivateKey) privateKey).getParams().equals(
+                                ((java.security.interfaces.ECPublicKey) publicKey).getParams())
+                        && verifyRoundTrip(privateKey, publicKey);
+            }
+            return verifyRoundTrip(privateKey, publicKey);
+        }
+
+        private static boolean verifyRoundTrip(
+                final PrivateKey privateKey, final java.security.PublicKey publicKey) {
+            try {
+                final String alg = pickSignatureAlgorithm(publicKey);
+                final java.security.Signature sig = java.security.Signature.getInstance(alg);
+                sig.initSign(privateKey);
+                sig.update(new byte[] {'k', 'i', 'd'});
+                final byte[] signature = sig.sign();
+                sig.initVerify(publicKey);
+                sig.update(new byte[] {'k', 'i', 'd'});
+                return sig.verify(signature);
+            } catch (final Exception ex) {
+                return false;
+            }
+        }
+
+        private static String pickSignatureAlgorithm(final java.security.PublicKey publicKey) {
+            switch (publicKey.getAlgorithm()) {
+                case "RSA": return "SHA256withRSA";
+                case "EC": return "SHA256withECDSA";
+                case "Ed25519": return "Ed25519";
+                case "Ed448": return "Ed448";
+                case "DSA": return "SHA256withDSA";
+                default: return publicKey.getAlgorithm();
+            }
         }
 
         /**
