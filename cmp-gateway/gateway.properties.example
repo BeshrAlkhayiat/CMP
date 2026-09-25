@@ -21,9 +21,13 @@ auth.keystore.path=/path/to/client-cert.p12
 auth.keystore.password=changeit
 auth.keystore.alias=client
 
-# CA truststore containing the CEMA HTTPS server certificate or issuing CA
-auth.truststore.path=/path/to/cema-truststore.p12
-auth.truststore.password=truststore-password
+# Truststore for CMP protection validation is OPTIONAL: by default the gateway
+# fetches the CA chain automatically from CEMA via GET /ca/{caName}/chain.
+# Only set auth.truststore.path if you want to pin trust anchors in a file
+# (PKCS12/JKS containing the CA certificate(s) with CA:TRUE, no private keys);
+# it is used as fallback when the automatic fetch fails.
+auth.truststore.path=
+auth.truststore.password=
 auth.truststore.type=PKCS12
 
 # CMP Protection Secret (text format, used for MAC-based protection)

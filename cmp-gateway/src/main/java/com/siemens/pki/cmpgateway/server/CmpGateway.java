@@ -108,6 +108,21 @@ public final class CmpGateway {
                 config.getKeystorePassword(),
                 config.getKeyAlias(),
                 config.loadTrustStore());
+        // Automatic trust anchors for CMP protection validation: fetch the CA chain
+        // from CEMA itself (GET /ca/{caName}/chain) instead of requiring a manually
+        // exported truststore file. Fetched lazily on first use and cached; if it
+        // fails, GatewayConfig falls back to auth.truststore.path or skips path
+        // validation (with a log message).
+        config.setUpstreamTrustSupplier(() -> {
+            try {
+                return restClient.fetchCaChain(config.getCaName());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while fetching the CA chain", e);
+            } catch (IOException e) {
+                throw new IllegalStateException("Could not fetch the CA chain from CEMA", e);
+            }
+        });
         this.cmpRaInterface = CmpRaComponent.instantiateCmpRaComponent(config, new RestUpstream());
         this.httpServer = HttpServer.create(new InetSocketAddress(config.getCmpPort()), 0);
         httpServer.createContext(config.getCmpPath(), new CmpHandler());

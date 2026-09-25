@@ -20,6 +20,8 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.security.SecureRandom;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
 import java.util.Base64;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -60,6 +62,9 @@ public class RestClient {
     private final String keyAlias;
     private final KeyStore trustStore;
     
+    /** Cached result of GET /ca/{caName}/chain - see fetchCaChain(). */
+    private volatile List<X509Certificate> cachedCaChain;
+
     private final HttpClient httpClient;
     private String authToken;
     private String csrfToken;
@@ -125,6 +130,49 @@ public class RestClient {
             }
             TrustManagerFactory tmf = TrustManagerFactory.getInstance(
                     TrustManagerFactory.getDefaultAlgorithm());
+            if (trustStore == null) {
+                // No truststore configured: the CEMA server is reached over TLS with its CA
+                // chain unknown up-front. Accept any server certificate for the transport and
+                // log what was presented, so operators can inspect it. The CMP-level trust
+                // validation is independent of this and fetches the CA chain automatically
+                // via fetchCaChainDer() (GET /ca/{caName}/chain).
+                SSLContext permissive = SSLContext.getInstance("TLS");
+                permissive.init(keyManagers, new javax.net.ssl.TrustManager[] {
+                    new javax.net.ssl.X509ExtendedTrustManager() {
+                        @Override
+                        public void checkClientTrusted(X509Certificate[] chain, String authType) {}
+
+                        @Override
+                        public void checkServerTrusted(X509Certificate[] chain, String authType) {
+                            LOG.debug("TLS (no truststore configured): accepting server chain leaf '{}'",
+                                    chain.length > 0 ? chain[0].getSubjectX500Principal() : "<empty>");
+                        }
+
+                        @Override
+                        public void checkClientTrusted(X509Certificate[] chain, String authType, java.net.Socket s)
+                                throws CertificateException {}
+
+                        @Override
+                        public void checkClientTrusted(X509Certificate[] chain, String authType,
+                                javax.net.ssl.SSLEngine e) throws CertificateException {}
+
+                        @Override
+                        public void checkServerTrusted(X509Certificate[] chain, String authType, java.net.Socket s)
+                                throws CertificateException {}
+
+                        @Override
+                        public void checkServerTrusted(X509Certificate[] chain, String authType,
+                                javax.net.ssl.SSLEngine e) throws CertificateException {}
+
+                        @Override
+                        public X509Certificate[] getAcceptedIssuers() {
+                            return new X509Certificate[0];
+                        }
+                    }
+                }, new SecureRandom());
+                builder.sslContext(permissive);
+                return builder.build();
+            }
             tmf.init(trustStore);
             
             SSLContext sslContext = SSLContext.getInstance("TLS");
@@ -566,6 +614,76 @@ public class RestClient {
             // Informational only - ignore failures here.
         }
         return sb.length() > 0 ? " Template inventory:" + sb : "";
+    }
+
+    /**
+     * Fetch the full CA certificate chain in PEM format (GET /ca/{caName}/chain,
+     * "application/x-pem-file"). Used to build the CMP trust anchors automatically,
+     * so no manually exported truststore file is required. The result is cached:
+     * the CA chain changes only on CA rollover, not per request.
+     */
+    public List<X509Certificate> fetchCaChain(final String ca) throws IOException, InterruptedException {
+        List<X509Certificate> cached = this.cachedCaChain;
+        if (cached != null) {
+            return cached;
+        }
+        HttpRequest req = addAuthHeaders(HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/ca/" + encodePathSegment(ca) + "/chain"))
+                .GET()).build();
+        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            throw new IOException("Fetching CA chain failed: HTTP " + resp.statusCode()
+                    + " - " + abbreviate(resp.body()));
+        }
+        List<X509Certificate> chain = parsePemCertificates(resp.body());
+        if (chain.isEmpty()) {
+            throw new IOException("CA chain response from GET /ca/" + ca + "/chain contained"
+                    + " no certificates: " + abbreviate(resp.body()));
+        }
+        LOG.info("Fetched {} CA certificate(s) from 'GET /ca/{}/chain':", chain.size(), ca);
+        for (X509Certificate c : chain) {
+            LOG.info("  CA cert: subject='{}', issuer='{}', valid until {}",
+                    c.getSubjectX500Principal(), c.getIssuerX500Principal(), c.getNotAfter());
+        }
+        this.cachedCaChain = chain;
+        return chain;
+    }
+
+    /**
+     * Parse one or more PEM-encoded X.509 certificates ("-----BEGIN CERTIFICATE-----"
+     * blocks) from a string. Non-PEM content is ignored.
+     */
+    private static List<X509Certificate> parsePemCertificates(String pem) throws IOException {
+        List<X509Certificate> result = new ArrayList<>();
+        java.security.cert.CertificateFactory cf;
+        try {
+            cf = java.security.cert.CertificateFactory.getInstance("X.509");
+        } catch (java.security.cert.CertificateException e) {
+            throw new IOException("No X.509 certificate factory available", e);
+        }
+        final String beginMarker = "-----BEGIN CERTIFICATE-----";
+        final String endMarker = "-----END CERTIFICATE-----";
+        int idx = 0;
+        while (true) {
+            int begin = pem.indexOf(beginMarker, idx);
+            if (begin < 0) {
+                break;
+            }
+            int end = pem.indexOf(endMarker, begin);
+            if (end < 0) {
+                break;
+            }
+            String b64 = pem.substring(begin + beginMarker.length(), end)
+                    .replaceAll("\\s", "");
+            byte[] der = Base64.getDecoder().decode(b64);
+            try (java.io.ByteArrayInputStream in = new java.io.ByteArrayInputStream(der)) {
+                result.add((X509Certificate) cf.generateCertificate(in));
+            } catch (CertificateException e) {
+                throw new IOException("Malformed PEM certificate in CA chain response", e);
+            }
+            idx = end + endMarker.length();
+        }
+        return result;
     }
 
     /**

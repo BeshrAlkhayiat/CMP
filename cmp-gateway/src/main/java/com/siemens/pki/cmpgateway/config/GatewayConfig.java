@@ -237,6 +237,55 @@ public class GatewayConfig implements Configuration {
         }
     }
 
+    /**
+     * Trust anchors for validating signature-protected upstream (CA) CMP responses.
+     * Injected by Main after the REST client is created, so the gateway can fetch
+     * them automatically from CEMA (GET /ca/{caName}/chain) instead of requiring a
+     * manually exported truststore file. May be null before injection.
+     */
+    private volatile java.util.function.Supplier<List<X509Certificate>> upstreamTrustSupplier;
+
+    public void setUpstreamTrustSupplier(
+            java.util.function.Supplier<List<X509Certificate>> upstreamTrustSupplier) {
+        this.upstreamTrustSupplier = upstreamTrustSupplier;
+        // Invalidate any cached result so the new source takes effect immediately.
+        this.cachedAutomaticCaChain = null;
+        LOG.debug("upstream trust anchor supplier configured (automatic CA chain via GET /ca/{}/chain)",
+                caName);
+    }
+
+    /** Cache for the automatically fetched CA chain; failures are retried on next access. */
+    private volatile List<X509Certificate> cachedAutomaticCaChain;
+
+    /**
+     * Automatic trust anchors: the CA certificate chain fetched from CEMA via
+     * GET /ca/{caName}/chain (through the supplier injected above). Returns an empty
+     * list if no supplier is set or the fetch fails - the caller then falls back to
+     * the file-based truststore or skips path validation.
+     */
+    public List<X509Certificate> getAutomaticallyFetchedCaChain() {
+        java.util.function.Supplier<List<X509Certificate>> supplier = this.upstreamTrustSupplier;
+        if (supplier == null) {
+            return Collections.emptyList();
+        }
+        List<X509Certificate> cached = this.cachedAutomaticCaChain;
+        if (cached != null) {
+            return cached;
+        }
+        try {
+            List<X509Certificate> chain = supplier.get();
+            if (chain != null && !chain.isEmpty()) {
+                this.cachedAutomaticCaChain = chain;
+                return chain;
+            }
+            LOG.warn("automatic CA chain fetch returned no certificates");
+        } catch (Exception e) {
+            LOG.warn("could not fetch the CA chain automatically from CEMA "
+                    + "(GET /ca/" + caName + "/chain); falling back to the file truststore", e);
+        }
+        return Collections.emptyList();
+    }
+
     public List<X509Certificate> getCertificateChain() throws Exception {
         KeyStore ks = loadKeyStore();
         if (ks == null) {
@@ -462,18 +511,31 @@ public class GatewayConfig implements Configuration {
                     @Override
                     public Collection<X509Certificate> getTrustedCertificates() {
                         // Trust anchors for validating signature-protected upstream
-                        // responses: the certificates from the configured truststore.
-                        // If none are configured, return null to skip path validation
-                        // rather than an empty list, which fails with
-                        // "the trustAnchors parameter must be non-empty".
+                        // responses. Resolution order:
+                        //  1. The CA chain fetched automatically from CEMA
+                        //     (GET /ca/{caName}/chain) - no manual truststore needed.
+                        //  2. The file-based truststore from auth.truststore.path, if set.
+                        //  3. null -> skip certificate-path validation (never return an
+                        //     empty list, which breaks PKIX with
+                        //     "the trustAnchors parameter must be non-empty").
+                        List<X509Certificate> autoChain = getAutomaticallyFetchedCaChain();
+                        if (!autoChain.isEmpty()) {
+                            LOG.debug("upstream verification: validating protection certificates "
+                                    + "against {} automatically fetched CA chain certificate(s)",
+                                    autoChain.size());
+                            return autoChain;
+                        }
                         List<X509Certificate> trusted = getTrustedCertificatesFromTrustStore();
                         if (trusted.isEmpty()) {
-                            LOG.debug("upstream verification: no trust anchors configured, "
-                                    + "skipping protection-certificate path validation");
+                            LOG.debug("upstream verification: no trust anchors available "
+                                    + "(automatic CA chain fetch failed/unavailable and no usable "
+                                    + "truststore configured), skipping protection-certificate "
+                                    + "path validation");
                             return null;
                         }
                         LOG.debug("upstream verification: validating protection certificates "
-                                + "against {} trust anchor(s)", trusted.size());
+                                + "against {} trust anchor(s) from the file truststore",
+                                trusted.size());
                         return trusted;
                     }
 
