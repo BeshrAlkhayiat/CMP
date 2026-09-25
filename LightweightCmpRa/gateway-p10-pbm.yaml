@@ -19,4 +19,4 @@ ClientContext:
         trustedCertificates:
           - "file:///D:/Projects/cema/tomcat/base/conf/cema/db.RESTScript/CEMA.Demo/data/TrustStore/CEMA_Root_CA.cer"
       CertificationRequest: "file:///D:/Projects/CMP/LightweightCmpRa/src/test/java/com/siemens/pki/lightweightcmpra/test/config/credentials/CertificateRequest.der"
-      RequestImplictConfirm: false
+      RequestImplictConfirm: true
