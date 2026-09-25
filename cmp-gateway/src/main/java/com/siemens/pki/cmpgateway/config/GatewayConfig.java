@@ -586,13 +586,33 @@ public class GatewayConfig implements Configuration {
     
     @Override
     public VerificationContext getEnrollmentTrust(String certProfile, int bodyType) {
-        // Trust context for validating enrolled certificates
+        // Trust context for validating the ISSUED end-entity certificate.
+        // The RA component's downstream stage (RaDownstream.processCertResponse)
+        // runs validateCertAgainstTrust(issued cert, extraCerts of the response)
+        // and aborts with "could not validate trust chain of issued certificate"
+        // if that returns null/empty - which it did when we returned null here
+        // (in this RA version null anchors are a hard failure, not a skip).
+        // Correct behaviour for a gateway: trust exactly the issuing CA(s) of the
+        // CMP template in use - the chain fetched from CEMA via GET /ca/{caName}/chain.
         return new VerificationContext() {
             @Override
             public Collection<X509Certificate> getTrustedCertificates() {
-                // No enrollment trust configured: return null to skip certificate-path
-                // validation instead of an empty list (which breaks PKIX path building).
-                return null;
+                List<X509Certificate> caChain = getAutomaticallyFetchedCaChain();
+                LOG.info("enrollment verification: validating issued certificate against "
+                                + "{} trust anchor(s): {}",
+                        caChain.size(),
+                        caChain.stream()
+                                .map(c -> c.getSubjectX500Principal().getName())
+                                .collect(java.util.stream.Collectors.toList()));
+                return caChain.isEmpty() ? null : caChain;
+            }
+
+            @Override
+            public Collection<X509Certificate> getAdditionalCerts() {
+                // Path-building material: the CA chain itself acts as intermediate
+                // source (e.g. EE <- CEMA User CA <- CEMA Root CA anchor).
+                List<X509Certificate> caChain = getAutomaticallyFetchedCaChain();
+                return caChain.isEmpty() ? null : caChain;
             }
         };
     }

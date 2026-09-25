@@ -666,6 +666,16 @@ public final class CmpGateway {
             }
             final PKIMessage protectedResponse =
                     protector.generateAndProtectResponseTo(request, responseBody);
+            // Diagnostic: what the RA downstream stage will see when it validates the
+            // trust chain of the ISSUED certificate - its only path-building material
+            // is the extraCerts list of this message (RaDownstream.processCertResponse
+            // calls validateCertAgainstTrust(issued cert, asX509Certificates(extraCerts))).
+            LOG.info("self-generated upstream response ready: body type {}, granted={}, "
+                            + "extraCerts={} -> [{}]",
+                    responseBody.getType(),
+                    describeGrantStatus(responseBody),
+                    protectedResponse.getExtraCerts() == null ? 0 : protectedResponse.getExtraCerts().length,
+                    describeExtraCerts(protectedResponse));
             if (!isSignatureProtectedRequest(request)) {
                 return protectedResponse;
             }
@@ -716,6 +726,56 @@ public final class CmpGateway {
                 throw new IOException("could not rewrite senderKID of the self-generated"
                         + " signature-protected upstream response", ex);
             }
+        }
+
+        /**
+         * Diagnostic helper: short description of the CertRep status for logging.
+         */
+        private static String describeGrantStatus(final PKIBody responseBody) {
+            try {
+                if (responseBody.getContent() instanceof org.bouncycastle.asn1.cmp.CertRepMessage) {
+                    final org.bouncycastle.asn1.cmp.CertRepMessage rep =
+                            (org.bouncycastle.asn1.cmp.CertRepMessage) responseBody.getContent();
+                    if (rep.getResponse() != null && rep.getResponse().length > 0) {
+                        return String.valueOf(rep.getResponse()[0].getStatus().getStatus());
+                    }
+                }
+            } catch (final Exception ex) {
+                // diagnostic only - never fail the real flow because of logging
+            }
+            return "n/a";
+        }
+
+        /**
+         * Diagnostic helper: subject/issuer of every certificate embedded in the
+         * extraCerts of a message. The RA downstream validation of the issued
+         * certificate builds its PKIX path using ONLY these certificates plus the
+         * enrollment trust anchors, so this list tells you whether the issuing CA
+         * chain from CEMA actually made it into the CertRep.
+         */
+        private static String describeExtraCerts(final PKIMessage message) {
+            final org.bouncycastle.asn1.cmp.CMPCertificate[] extra = message.getExtraCerts();
+            if (extra == null || extra.length == 0) {
+                return "";
+            }
+            final StringBuilder sb = new StringBuilder();
+            for (final org.bouncycastle.asn1.cmp.CMPCertificate c : extra) {
+                try {
+                    final X509Certificate x = CertUtility.asX509Certificate(c);
+                    if (sb.length() > 0) {
+                        sb.append(", ");
+                    }
+                    sb.append(x.getSubjectX500Principal().getName())
+                            .append(" <- ")
+                            .append(x.getIssuerX500Principal().getName());
+                } catch (final Exception ex) {
+                    if (sb.length() > 0) {
+                        sb.append(", ");
+                    }
+                    sb.append("<unreadable>");
+                }
+            }
+            return sb.toString();
         }
 
         /**
