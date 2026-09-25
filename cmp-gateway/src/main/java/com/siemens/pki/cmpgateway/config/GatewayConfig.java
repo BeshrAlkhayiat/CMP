@@ -321,6 +321,38 @@ public class GatewayConfig implements Configuration {
         return Collections.emptyList();
     }
 
+    /**
+     * Split a certificate chain by self-signedness. A certificate counts as
+     * self-signed when subject and issuer DN are identical; the signature is not
+     * re-checked here (that is done during PKIX path building). Used to keep trust
+     * anchors and path-building material apart: only self-signed roots may be
+     * anchors - see {@link #getEnrollmentTrust(String, int)} for why mixing the two
+     * silently empties the extraCerts of the downstream CertRep.
+     *
+     * @param certs      the certificates to filter (may be null or empty)
+     * @param selfSigned true to keep the self-signed (root) certificates, false to
+     *                   keep the non-self-signed (intermediate) ones
+     * @return a new list with the matching certificates
+     */
+    private static List<X509Certificate> filterSelfSigned(
+            final List<X509Certificate> certs, final boolean selfSigned) {
+        if (certs == null || certs.isEmpty()) {
+            return Collections.emptyList();
+        }
+        final List<X509Certificate> result = new ArrayList<>();
+        for (X509Certificate cert : certs) {
+            if (cert == null) {
+                continue;
+            }
+            final boolean isSelfSigned = cert.getSubjectX500Principal()
+                    .equals(cert.getIssuerX500Principal());
+            if (isSelfSigned == selfSigned) {
+                result.add(cert);
+            }
+        }
+        return result;
+    }
+
     public List<X509Certificate> getCertificateChain() throws Exception {
         KeyStore ks = loadKeyStore();
         if (ks == null) {
@@ -594,25 +626,59 @@ public class GatewayConfig implements Configuration {
         // (in this RA version null anchors are a hard failure, not a skip).
         // Correct behaviour for a gateway: trust exactly the issuing CA(s) of the
         // CMP template in use - the chain fetched from CEMA via GET /ca/{caName}/chain.
+        //
+        // IMPORTANT: only the actual ROOT (self-signed) certificate of that chain may
+        // be registered as a trust anchor; every non-self-signed CA (e.g. an
+        // intermediate such as "CEMA User CA") must appear ONLY in
+        // getAdditionalCerts() as path-building material. Registering the whole chain
+        // as anchors silently destroys the extraCerts the LCMP client needs:
+        // Java's PKIXCertPathBuilderResult.getCertPath() excludes the trust anchor
+        // from the returned path by contract, so when the direct issuer of the EE
+        // cert (CEMA User CA) is itself an anchor, the built path degenerates to
+        // [enrolledCert]. RaDownstream.processCertResponse then filters out the leaf
+        // and stores issuingChain = [] - validation still succeeds (granted, not
+        // signerNotTrusted), but MsgOutputProtector rebuilds the downstream
+        // extraCerts from protectingExtraCerts(protector) U issuingChain, PBM
+        // protection contributes nothing, and the client receives a CertRep with
+        // zero extraCerts and NPEs building the enrollment chain.
         return new VerificationContext() {
             @Override
             public Collection<X509Certificate> getTrustedCertificates() {
-                List<X509Certificate> caChain = getAutomaticallyFetchedCaChain();
+                // Trust anchors: the self-signed root(s) of the CA chain only.
+                List<X509Certificate> roots = filterSelfSigned(getAutomaticallyFetchedCaChain(), true);
+                if (roots.isEmpty()) {
+                    // Degenerate configuration: the fetched chain contains no
+                    // self-signed certificate at all (e.g. a single-CA hierarchy
+                    // whose only member is cross-signed or an incomplete chain
+                    // export). Falling back to the full chain keeps enrollment
+                    // working; note that in that case the issuing CA cannot appear
+                    // in the client's extraCerts because it IS the anchor.
+                    LOG.warn("enrollment verification: the fetched CA chain contains no "
+                            + "self-signed root; falling back to treating the whole chain "
+                            + "as trust anchors");
+                    roots = getAutomaticallyFetchedCaChain();
+                }
+                final List<X509Certificate> anchors = roots;
                 LOG.info("enrollment verification: validating issued certificate against "
                                 + "{} trust anchor(s): {}",
-                        caChain.size(),
-                        caChain.stream()
+                        anchors.size(),
+                        anchors.stream()
                                 .map(c -> c.getSubjectX500Principal().getName())
                                 .collect(java.util.stream.Collectors.toList()));
-                return caChain.isEmpty() ? null : caChain;
+                return anchors.isEmpty() ? null : anchors;
             }
 
             @Override
             public Collection<X509Certificate> getAdditionalCerts() {
-                // Path-building material: the CA chain itself acts as intermediate
-                // source (e.g. EE <- CEMA User CA <- CEMA Root CA anchor).
-                List<X509Certificate> caChain = getAutomaticallyFetchedCaChain();
-                return caChain.isEmpty() ? null : caChain;
+                // Path-building material: the non-self-signed CAs of the chain
+                // (e.g. EE <- CEMA User CA <- CEMA Root CA anchor). Keeping them
+                // OUT of the anchor set is what makes PKIX path building return
+                // [enrolledCert, CEMA User CA] so that after the leaf filter the
+                // issuingChain - and hence the downstream extraCerts - actually
+                // contain the certificate the client needs to build its chain.
+                List<X509Certificate> intermediates =
+                        filterSelfSigned(getAutomaticallyFetchedCaChain(), false);
+                return intermediates.isEmpty() ? null : intermediates;
             }
         };
     }
