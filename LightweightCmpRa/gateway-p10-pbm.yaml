@@ -16,7 +16,7 @@ ClientContext:
   - EnrollmentContext:
       EnrollmentType: P10CR
       EnrollmentTrust:
-        trustedCertificates:"
+        trustedCertificates:
           - "file:///D:/Projects/CMP/LightweightCmpRa/CEMA_Root_CA.cer"
       CertificationRequest: "file:///D:/Projects/CMP/LightweightCmpRa/src/test/java/com/siemens/pki/lightweightcmpra/test/config/credentials/CertificateRequest.der"
       RequestImplictConfirm: true
