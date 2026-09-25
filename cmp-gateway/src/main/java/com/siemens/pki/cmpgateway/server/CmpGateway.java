@@ -248,8 +248,23 @@ public final class CmpGateway {
                 // anchor outside this narrow case.
                 config.setProcessingSelfGeneratedUpstreamMessage(true);
             }
+            // The "bodyType" argument is the PKIBody type of the FIRST request of
+            // this transaction (persistencyContext.getRequestType(), see
+            // CmpRaImplementation.upstreamExchange - it is even logged as
+            // "for first bodyType <n>"). It never changes for follow-up messages:
+            // when OpenSSL sends CERTCONF after the CP, bodyType is still 4 (P10CR).
+            // Dispatching the switch on bodyType therefore routed every follow-up
+            // message back into "case TYPE_P10_CERT_REQ -> issuePkcs10()", which ran
+            // CertificationRequest.getInstance() on the CertConfirm body content (a
+            // DEROctetString) and threw ClassCastException, surfacing to the client as
+            // "systemFailure ... exception processing request at upstream interface
+            // for first bodyType 4". Switch on the actual message body; fall back to
+            // bodyType only if the message could not be parsed.
+            final int currentBodyType = message.getBody() != null
+                    ? message.getBody().getType()
+                    : bodyType;
             try {
-                switch (bodyType) {
+                switch (currentBodyType) {
                     case PKIBody.TYPE_P10_CERT_REQ:
                         return issuePkcs10(message, certProfile, persistencyContext);
                     case PKIBody.TYPE_REVOCATION_REQ:
@@ -274,6 +289,19 @@ public final class CmpGateway {
                         // CertConfirm (PKIConf, RFC 4210 5.3.23): OpenSSL's CMP client
                         // sends this after receiving the CP to confirm acceptance of the
                         // issued certificate. There is no CEMA backend action to perform.
+                        // IMPORTANT: the "bodyType" argument of this callback is the type
+                        // of the FIRST request of the transaction (persistencyContext
+                        // .getRequestType() - see CmpRaImplementation.upstreamExchange,
+                        // "for first bodyType <n>"), NOT the type of the current message.
+                        // For a P10CR enrollment that value stays 4 forever, so a switch
+                        // on bodyType can never see the follow-up CERTCONF here: the
+                        // callback kept falling into "case TYPE_P10_CERT_REQ ->
+                        // issuePkcs10()", which ran CertificationRequest.getInstance()
+                        // on the CertConfirm body content (a DEROctetString) and threw
+                        // ClassCastException -> "systemFailure ... exception processing
+                        // request at upstream interface for first bodyType 4". Dispatch
+                        // on the actual message body instead; the same applies to every
+                        // post-first-request message type handled below.
                         // Acknowledge exactly like the LCMP RA component itself does when
                         // it handles CertConfirm locally (CmpRaUpstream.handleRequest,
                         // delayed-delivery branch): an UNPROTECTED PkiAcceptConf built
@@ -291,14 +319,10 @@ public final class CmpGateway {
                         //    echoed header made the second-request check in
                         //    TransactionStateTracker fail with "sender/recipient nonce
                         //    mismatch", surfacing to the client as systemFailure.
-                        // Without this case the switch fell through and the RA retried
-                        // the stored P10CR request body against issuePkcs10(), which hit
-                        // CertificationRequest.getInstance() on a DEROctetString and
-                        // surfaced to the client as
-                        // "systemFailure ... exception processing request at upstream
-                        // interface for first bodyType 4".
-                        LOG.info("acknowledging CertConfirm (body type {}) with"
-                                + " unprotected PkiAcceptConf (no CEMA backend action)", bodyType);
+                        LOG.info("acknowledging CertConfirm (message body type {}, first"
+                                + " request body type {}) with unprotected PkiAcceptConf"
+                                + " (no CEMA backend action)",
+                                message.getBody().getType(), bodyType);
                         return PkiMessageGenerator.generateUnprotectMessage(
                                         PkiMessageGenerator.buildRespondingHeaderProvider(message),
                                         PkiMessageGenerator.generatePkiConfirmBody())
