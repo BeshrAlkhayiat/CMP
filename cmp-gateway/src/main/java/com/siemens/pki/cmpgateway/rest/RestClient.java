@@ -44,14 +44,12 @@ public class RestClient {
     
     private final String baseUrl;
     /**
-     * The CA name actually used for all upstream calls. CEMA looks up its CAConfig objects by a
-     * lower-cased name ("lowerName"), so the configured display name (e.g. "CEMA User CA") is
-     * resolved against GET /ca (the list of CA names the caller is authorized for) and replaced
-     * by the server's exact spelling as soon as a case-insensitive match is found. Falls back to
-     * the configured name if the lookup fails or no CA matches.
+     * The CA name used for all upstream calls, exactly as configured in gateway.properties.
+     * Tolerant matching against the server's spelling (GET /ca) was deliberately removed:
+     * CEMA resolves CAConfig objects by their lower-cased name, so an unknown or misspelled
+     * ca.name now fails fast with a 404 whose diagnostic lists the available CA names.
      */
-    private volatile String caName;
-    private final String configuredCaName;
+    private final String caName;
     private final String tplName;
     private final String lookupName;
     private final String authType;
@@ -89,8 +87,9 @@ public class RestClient {
                       KeyStore keyStore, String keystorePassword, String keyAlias,
                       KeyStore trustStore) throws Exception {
         this.baseUrl = baseUrl;
-        this.configuredCaName = caName;
         this.caName = caName;
+        LOG.info("REST client configured for base URL '{}', CA name '{}' (exact match, no fuzzy lookup)",
+                baseUrl, caName);
         this.tplName = tplName;
         this.lookupName = lookupName;
         this.authType = authType;
@@ -516,76 +515,6 @@ public class RestClient {
     }
 
     /**
-     * Normalize a CA/template name for tolerant comparison: trimmed, whitespace runs collapsed
-     * to a single space, lower-cased. This absorbs the cosmetic differences that show up between
-     * how operators write ca.name in gateway.properties ("CEMA User CA") and how the CA is
-     * registered on the server ("CEMA-User-CA", "cema user ca", ...).
-     */
-    private static String normalizeName(final String name) {
-        return name == null ? "" : name.trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", " ");
-    }
-
-    /**
-     * Find the server's exact spelling of a CA name using a tolerant (case- and
-     * separator-insensitive) comparison.
-     * CEMA stores each CAConfig under a lower-cased name ("lowerName") but returns the original
-     * display name from GET /ca; matching tolerates differences in capitalization and
-     * space/hyphen/underscore separators between the configured ca.name and the registered CA.
-     * An exact match always wins over a fuzzy one.
-     *
-     * @return the matching CA name as reported by the server, or null if no CA matches
-     */
-    private String findMatchingCaName(final String wanted) {
-        if (wanted == null || wanted.isBlank()) {
-            return null;
-        }
-        try {
-            List<String> serverNames = listCaNames();
-            // Pass 1: exact match.
-            for (String serverName : serverNames) {
-                if (serverName.equals(wanted)) {
-                    return serverName;
-                }
-            }
-            // Pass 2: case-insensitive match.
-            for (String serverName : serverNames) {
-                if (serverName.equalsIgnoreCase(wanted)) {
-                    return serverName;
-                }
-            }
-            // Pass 3: fully normalized match (ignores spaces vs. hyphens/underscores, e.g.
-            // configured "CEMA User CA" resolves to registered "CEMA-User-CA").
-            final String wantedNorm = normalizeName(wanted)
-                    .replace('-', ' ').replace('_', ' ');
-            for (String serverName : serverNames) {
-                String norm = normalizeName(serverName).replace('-', ' ').replace('_', ' ');
-                if (norm.equals(wantedNorm)) {
-                    return serverName;
-                }
-            }
-        } catch (IOException | InterruptedException e) {
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
-            LOG.warn("Could not resolve CA name '{}' against GET /ca: {}", wanted, e.getMessage());
-        }
-        return null;
-    }
-
-    /**
-     * Ensure {@link #caName} holds the server's exact CA spelling before issuing requests that
-     * embed it in the path. Resolution happens once per (configured) name; a failure to resolve
-     * simply keeps the configured value so the request still goes out with a meaningful error.
-     */
-    private void ensureCaNameResolved() {
-        String resolved = findMatchingCaName(configuredCaName);
-        if (resolved != null && !resolved.equals(caName)) {
-            LOG.info("Resolved configured CA name '{}' to server name '{}'", configuredCaName, resolved);
-            this.caName = resolved;
-        }
-    }
-
-    /**
      * True if a REST error body reports that the CA object could not be found on the server,
      * e.g. {@code MissingObjectException: missing CAConfig with lowerName 'cema user ca'}.
      */
@@ -667,9 +596,6 @@ public class RestClient {
     private String describeUnknownCa(String body) {
         StringBuilder sb = new StringBuilder();
         sb.append("CEMA has no CA named '").append(caName).append("'");
-        if (configuredCaName != null && !configuredCaName.equals(caName)) {
-            sb.append(" (resolved from configured name '").append(configuredCaName).append("')");
-        }
         sb.append(". Server response: ").append(abbreviate(body));
         try {
             List<String> available = listCaNames();
@@ -694,10 +620,13 @@ public class RestClient {
      * @return IssuedCertificateData or PendingRequest info
      */
     public CertificateResult issueCertificate(String csr) throws IOException, InterruptedException {
-        ensureCaNameResolved();
         LOG.info("Issuing certificate for CA: {}, Template: {}", caName, tplName);
         
         String issueUrl = baseUrl + "/ca/" + encodePathSegment(caName) + "/template/" + encodePathSegment(tplName) + "/issue";
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Issue request: {} byte PKCS#10 CSR against {}",
+                    Base64.getDecoder().decode(csr).length, issueUrl);
+        }
         
         ObjectNode request = MAPPER.createObjectNode();
         request.put("csr", csr);
@@ -719,7 +648,7 @@ public class RestClient {
         
         HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
         
-        LOG.debug("Issue response status: {}", resp.statusCode());
+        LOG.debug("Issue response: HTTP {}, body: {}", resp.statusCode(), abbreviate(resp.body()));
         
         if (resp.statusCode() == 201) {
             // Certificate issued immediately
@@ -729,6 +658,7 @@ public class RestClient {
             // Certificate pending
             JsonNode result = MAPPER.readTree(resp.body());
             String uuid = result.path("uuid").asText();
+            LOG.info("Certificate issuance is pending on CEMA, request UUID: {}", uuid);
             pendingRequests.put(uuid, new PendingRequest(uuid, 2)); // 2 = CR body type
             return new CertificateResult(true, uuid, result.path("msg").asText());
         } else {
@@ -742,7 +672,8 @@ public class RestClient {
     public CertificateResult generateCertificate(
                 final String kind, final Integer size, final String ecCurve, final String commonName)
                 throws IOException, InterruptedException {
-            ensureCaNameResolved();
+            LOG.info("Central key generation for CA: {}, Template: {} (kind={}, size={}, ecCurve={}, CN={})",
+                    caName, tplName, kind, size, ecCurve, commonName);
             String generateUrl = baseUrl + "/ca/" + encodePathSegment(caName) + "/template/" + encodePathSegment(tplName) + "/generate";
             ObjectNode request = MAPPER.createObjectNode();
             request.put("kind", kind);
@@ -768,12 +699,15 @@ public class RestClient {
                     .header("Content-Type", "application/json");
             HttpRequest httpRequest = addAuthHeaders(httpRequestBuilder).build();
             HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+            LOG.debug("Generate response: HTTP {}, body: {}", response.statusCode(),
+                    abbreviate(response.body()));
             if (response.statusCode() == 201) {
                 return parseCertificateResult(MAPPER.readTree(response.body()));
             }
             if (response.statusCode() == 202) {
                 JsonNode result = MAPPER.readTree(response.body());
                 String uuid = result.path("uuid").asText();
+                LOG.info("Central key generation is pending on CEMA, request UUID: {}", uuid);
                 pendingRequests.put(uuid, new PendingRequest(uuid, 0));
                 return new CertificateResult(true, uuid, result.path("msg").asText());
             }
@@ -812,27 +746,60 @@ public class RestClient {
         } else if (resp.statusCode() == 202) {
             JsonNode result = MAPPER.readTree(resp.body());
             String uuid = result.path("uuid").asText();
+            LOG.info("Auto-issuance is pending on CEMA, request UUID: {}", uuid);
             pendingRequests.put(uuid, new PendingRequest(uuid, 2));
             return new CertificateResult(true, uuid, result.path("msg").asText());
         } else {
+            LOG.error("Auto certificate issuance failed: HTTP {} - {}", resp.statusCode(),
+                    abbreviate(resp.body()));
             throw new IOException("Auto certificate issuance failed: " + resp.statusCode() + " - " + resp.body());
         }
     }
     
     /**
+     * Map an RFC 5280 CRL reason code (as carried in a CMP RevReq inside
+     * {@code RevDetails.crlEntryDetails}) to the corresponding CEMA RevocationReason
+     * enum name. Reason code 7 (unused in RFC 5280) and REMOVE_FROM_CRL (which has no
+     * CMP numeric equivalent) cannot be reached from a CMP request; unknown codes are
+     * logged and mapped to UNSPECIFIED rather than failing the revocation outright.
+     */
+    static String mapRevocationReason(final int reasonCode) {
+        switch (reasonCode) {
+            case 0: return "UNSPECIFIED";
+            case 1: return "KEY_COMPROMISE";
+            case 2: return "CA_COMPROMISE";
+            case 3: return "AFFILIATION_CHANGED";
+            case 4: return "SUPERSEDED";
+            case 5: return "CESSATION_OF_OPERATION";
+            case 6: return "CERTIFICATE_HOLD";
+            case 8: return "PRIVILEGE_WITHDRAWN";
+            case 9: return "AA_COMPROMISE";
+            default:
+                LOG.warn("revocation reason code {} has no CEMA RevocationReason equivalent,"
+                        + " sending UNSPECIFIED", reasonCode);
+                return "UNSPECIFIED";
+        }
+    }
+
+    /**
      * Revoke a certificate.
      * @param serial Serial number of certificate to revoke
-     * @param reason Revocation reason code
+     * @param reason Revocation reason code (RFC 5280 CRL reason, mapped to the CEMA enum)
      */
     public boolean revokeCertificate(String serial, int reason) throws IOException, InterruptedException {
-        ensureCaNameResolved();
-        LOG.info("Revoking certificate with serial: {}, reason: {}", serial, reason);
+        final String cemaReason = mapRevocationReason(reason);
+        LOG.info("Revoking certificate with serial: {}, reason: {} -> CEMA reason '{}'",
+                serial, reason, cemaReason);
         
         String revokeUrl = baseUrl + "/ca/" + encodePathSegment(caName) + "/revoke";
         
         ObjectNode request = MAPPER.createObjectNode();
         request.put("serial", serial);
-        request.put("reason", reason);
+        // Per the OpenAPI spec, RevocationRequest.reason is a RevocationReason string enum
+        // (UNSPECIFIED, KEY_COMPROMISE, ...), NOT an integer - sending the raw number makes
+        // CEMA reject the request with HTTP 400 ("no enum constant"), the same class of bug as
+        // sending "CMP" for the EnrollmentProtocol field in the issue requests.
+        request.put("reason", cemaReason);
         
         HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
                 .uri(URI.create(revokeUrl))
@@ -842,6 +809,7 @@ public class RestClient {
         
         HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
         
+        LOG.debug("Revoke response: HTTP {}, body: {}", resp.statusCode(), abbreviate(resp.body()));
         if (resp.statusCode() == 200) {
             LOG.info("Certificate revoked successfully");
             return true;
@@ -855,8 +823,7 @@ public class RestClient {
      * @param uuid UUID of pending request
      */
     public CertificateResult fetchPendingCertificate(String uuid) throws IOException, InterruptedException {
-        ensureCaNameResolved();
-        LOG.info("Fetching pending certificate: {}", uuid);
+        LOG.info("Fetching pending certificate: {} ({} pending tracked)", uuid, pendingRequests.size());
         
         String fetchUrl = baseUrl + "/ca/" + encodePathSegment(caName) + "/fetch";
         
@@ -871,14 +838,18 @@ public class RestClient {
         
         HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
         
+        LOG.debug("Fetch response: HTTP {}, body: {}", resp.statusCode(), abbreviate(resp.body()));
         if (resp.statusCode() == 201) {
             JsonNode result = MAPPER.readTree(resp.body());
             CertificateResult certResult = parseCertificateResult(result);
             pendingRequests.remove(uuid);
+            LOG.info("Pending certificate {} retrieved, {} byte(s) of certificate data", uuid,
+                    certResult.certificate != null ? certResult.certificate.length : 0);
             return certResult;
         } else if (resp.statusCode() == 202) {
             // Still pending
             JsonNode result = MAPPER.readTree(resp.body());
+            LOG.debug("Certificate {} is still pending: {}", uuid, result.path("msg").asText(""));
             return new CertificateResult(true, uuid, result.path("msg").asText());
         } else {
             throw caScopedFailure("Fetch", resp.statusCode(), resp.body());

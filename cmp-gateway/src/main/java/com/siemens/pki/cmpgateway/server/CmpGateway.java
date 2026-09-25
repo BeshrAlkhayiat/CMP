@@ -56,6 +56,7 @@ import org.bouncycastle.asn1.cmp.PKIBody;
 import org.bouncycastle.asn1.cmp.PKIMessage;
 import org.bouncycastle.asn1.cmp.PKIStatus;
 import org.bouncycastle.asn1.cmp.PKIStatusInfo;
+import org.bouncycastle.asn1.cmp.RevDetails;
 import org.bouncycastle.asn1.cmp.RevRepContentBuilder;
 import org.bouncycastle.asn1.cmp.RevReqContent;
 import org.bouncycastle.asn1.crmf.CertReqMessages;
@@ -67,7 +68,10 @@ import org.bouncycastle.asn1.x500.AttributeTypeAndValue;
 import org.bouncycastle.asn1.x500.RDN;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x500.style.BCStyle;
+import org.bouncycastle.asn1.x500.style.IETFUtils;
 import org.bouncycastle.asn1.x509.Certificate;
+import org.bouncycastle.asn1.x509.Extension;
+import org.bouncycastle.asn1.x509.Extensions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -238,7 +242,11 @@ public final class CmpGateway {
                     Base64.getEncoder().encodeToString(request.getHeader().getTransactionID().getOctets());
             if (!Boolean.TRUE.equals(centralKeyRequests.remove(transactionKey))
                     && !isCentralKeyGenerationRequest(template)) {
-                return issueCrmf(request, certReqMsg, certProfile);
+                // Ordinary CRMF with a client-supplied public key: CEMA has no
+                // endpoint for it yet, so fail directly here.
+                throw new UnsupportedOperationException(
+                        "ordinary CRMF issuance (with subject public key) is not representable by the "
+                                + "available CEMA REST API");
             }
             return generateCentralKey(request, certReqMsg, persistencyContext);
         }
@@ -257,13 +265,6 @@ public final class CmpGateway {
                 }
             }
             return true;
-        }
-
-        private byte[] issueCrmf(
-                final PKIMessage request, final CertReqMsg certReqMsg, final String certProfile) {
-            throw new UnsupportedOperationException(
-                    "ordinary CRMF issuance (with subject public key) is not representable by the "
-                            + "available CEMA REST API");
         }
 
         private byte[] generateCentralKey(
@@ -424,19 +425,46 @@ public final class CmpGateway {
 
         private byte[] revoke(final PKIMessage request) throws Exception {
             final RevReqContent content = RevReqContent.getInstance(request.getBody().getContent());
-            if (content.toRevDetailsArray().length == 0
-                    || content.toRevDetailsArray()[0].getCertDetails().getSerialNumber() == null) {
+            final RevDetails[] revDetails = content.toRevDetailsArray();
+            if (revDetails.length == 0
+                    || revDetails[0].getCertDetails().getSerialNumber() == null) {
                 throw new IllegalArgumentException("revocation request does not contain a certificate serial number");
             }
             final BigInteger serial =
-                    content.toRevDetailsArray()[0].getCertDetails().getSerialNumber().getValue();
-            restClient.revokeCertificate(serial.toString(), 0);
+                    revDetails[0].getCertDetails().getSerialNumber().getValue();
+            restClient.revokeCertificate(serial.toString(), extractReasonCode(revDetails[0]));
+            // RevRepContent is explicitly allowed to be unprotected per RFC 4210 /
+            // RFC 9483, and the RA component's upstream ProtectionValidator accepts
+            // an unprotected REVOCATION_REP - so no protection is added here.
             final PKIBody responseBody = new PKIBody(
                     PKIBody.TYPE_REVOCATION_REP,
                     new RevRepContentBuilder().add(new PKIStatusInfo(PKIStatus.granted)).build());
             return PkiMessageGenerator.generateUnprotectMessage(
                             PkiMessageGenerator.buildRespondingHeaderProvider(request), responseBody)
                     .getEncoded();
+        }
+
+        /**
+         * Extract the CRL reason code (RFC 5280 {@code reasonCode} extension inside
+         * {@code RevDetails.crlEntryDetails}) from a CMP revocation request. Returns
+         * 0 (unspecified) when the client did not supply the extension; values are
+         * clamped to the legal 0..10 range (the RA component's MessageBodyValidator
+         * rejects out-of-range codes before this point, this is just defensive).
+         */
+        private static int extractReasonCode(final RevDetails revDetails) {
+            final Extensions crlEntryDetails = revDetails.getCrlEntryDetails();
+            if (crlEntryDetails == null) {
+                return 0;
+            }
+            final Extension reasonCodeExt = crlEntryDetails.getExtension(Extension.reasonCode);
+            if (reasonCodeExt == null) {
+                return 0;
+            }
+            final long reasonCode = org.bouncycastle.asn1.ASN1Enumerated
+                    .getInstance(reasonCodeExt.getParsedValue())
+                    .getValue()
+                    .longValue();
+            return (int) Math.min(Math.max(reasonCode, 0L), 10L);
         }
 
         private byte[] certificateResponse(
