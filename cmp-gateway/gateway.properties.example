@@ -41,3 +41,9 @@ central.key.size=2048
 # Timing Configuration
 retry.after.seconds=30
 downstream.timeout.seconds=300
+
+# CRMF (initReq/certReq/keyUpdateReq) handling. The CEMA REST API currently
+# supports CSR (PKCS#10) enrollment only, so this defaults to false: CRMF requests
+# are rejected with a readable CMP error instead of being forwarded to CEMA.
+# Set to true once the backend can process CRMF.
+crm.enabled=false

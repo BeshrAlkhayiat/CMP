@@ -1,0 +1,149 @@
+From d4df503a8ef3460bfe92865f60d407f7844db751 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Wed, 23 Sep 2026 16:18:09 +0000
+Subject: [PATCH] Add crm.enabled switch (default false): reject CRMF with
+ readable CMP error since CEMA supports CSR/PKCS#10 only
+
+---
+ cmp-gateway/gateway.properties.example        |  6 ++
+ .../java/com/siemens/pki/cmpgateway/Main.java |  2 +
+ .../pki/cmpgateway/config/GatewayConfig.java  |  6 ++
+ .../pki/cmpgateway/server/CmpGateway.java     | 57 +++++++++++++++++++
+ 4 files changed, 71 insertions(+)
+
+diff --git a/cmp-gateway/gateway.properties.example b/cmp-gateway/gateway.properties.example
+index f721a03..fad5d84 100644
+--- a/cmp-gateway/gateway.properties.example
++++ b/cmp-gateway/gateway.properties.example
+@@ -41,3 +41,9 @@ central.key.size=2048
+ # Timing Configuration
+ retry.after.seconds=30
+ downstream.timeout.seconds=300
++
++# CRMF (initReq/certReq/keyUpdateReq) handling. The CEMA REST API currently
++# supports CSR (PKCS#10) enrollment only, so this defaults to false: CRMF requests
++# are rejected with a readable CMP error instead of being forwarded to CEMA.
++# Set to true once the backend can process CRMF.
++crm.enabled=false
+diff --git a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/Main.java b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/Main.java
+index aee7daa..d8a4ac0 100644
+--- a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/Main.java
++++ b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/Main.java
+@@ -99,6 +99,8 @@ public class Main {
+             if (centralKeySize != null) {
+                 config.setCentralKeySize(Integer.parseInt(centralKeySize));
+             }
++            config.setCrmfEnabled(Boolean.parseBoolean(
++                    props.getProperty("crm.enabled", String.valueOf(config.isCrmfEnabled())).trim()));
+             
+             LOG.info("Configuration loaded from {}", configPath);
+             
+diff --git a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/config/GatewayConfig.java b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/config/GatewayConfig.java
+index 096f8f6..15833b4 100644
+--- a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/config/GatewayConfig.java
++++ b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/config/GatewayConfig.java
+@@ -54,6 +54,7 @@ public class GatewayConfig implements Configuration {
+     private String centralKeyKind;
+     private Integer centralKeySize;
+     private String centralKeyCurve;
++    private boolean crmfEnabled;
+     
+     public GatewayConfig() {
+         // Defaults
+@@ -68,6 +69,9 @@ public class GatewayConfig implements Configuration {
+         this.cmpPath = "/cmp";
+         this.centralKeyKind = "RSA";
+         this.centralKeySize = 2048;
++        // The CEMA REST API currently supports PKCS#10 (CSR) enrollment only,
++        // so CRMF handling is disabled by default.
++        this.crmfEnabled = false;
+         this.sharedSecret = "gateway-secret-key".getBytes();
+     }
+     
+@@ -128,6 +132,8 @@ public class GatewayConfig implements Configuration {
+     public void setCentralKeySize(Integer centralKeySize) { this.centralKeySize = centralKeySize; }
+     public String getCentralKeyCurve() { return centralKeyCurve; }
+     public void setCentralKeyCurve(String centralKeyCurve) { this.centralKeyCurve = centralKeyCurve; }
++    public boolean isCrmfEnabled() { return crmfEnabled; }
++    public void setCrmfEnabled(boolean crmfEnabled) { this.crmfEnabled = crmfEnabled; }
+     
+     /**
+      * Load PKCS#12 keystore and extract certificate chain and private key.
+diff --git a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java
+index 4e57217..18a8a63 100644
+--- a/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java
++++ b/cmp-gateway/src/main/java/com/siemens/pki/cmpgateway/server/CmpGateway.java
+@@ -148,6 +148,16 @@ public final class CmpGateway {
+                     case PKIBody.TYPE_INIT_REQ:
+                     case PKIBody.TYPE_CERT_REQ:
+                     case PKIBody.TYPE_KEY_UPDATE_REQ:
++                        if (!config.isCrmfEnabled()) {
++                            // The CEMA REST API supports CSR (PKCS#10) enrollment only.
++                            // Reject CRMF with a readable error instead of failing later
++                            // in the upstream protection/validation chain.
++                            return errorMessage(message, bodyType,
++                                    "CRMF is not supported by this gateway; the CEMA backend"
++                                            + " accepts PKCS#10 (CSR) requests only."
++                                            + " Use a P10CR client transaction (e.g."
++                                            + " EnrollmentType: P10CR in the LCMP client config).");
++                        }
+                         return processCrmf(message, certProfile, persistencyContext);
+                     default:
+                         throw new UnsupportedOperationException(
+@@ -158,6 +168,53 @@ public final class CmpGateway {
+             }
+         }
+ 
++        /**
++         * Build a CMP error response (PKIResponse with status rejection) for the
++         * given request. Used to reject message types the CEMA backend cannot
++         * handle (e.g. CRMF when only CSR issuance is available) with a readable
++         * statusInfo instead of an opaque transport-level ERROR.
++         */
++        private byte[] errorMessage(
++                final PKIMessage request, final int requestBodyType, final String text)
++                throws Exception {
++            final int responseType;
++            switch (requestBodyType) {
++                case PKIBody.TYPE_INIT_REQ:
++                    responseType = PKIBody.TYPE_INIT_REP;
++                    break;
++                case PKIBody.TYPE_CERT_REQ:
++                    responseType = PKIBody.TYPE_CERT_REP;
++                    break;
++                case PKIBody.TYPE_KEY_UPDATE_REQ:
++                    responseType = PKIBody.TYPE_KEY_UPDATE_REP;
++                    break;
++                default:
++                    responseType = PKIBody.TYPE_ERROR;
++            }
++            LOG.warn("rejecting CMP request: {}", text);
++            final org.bouncycastle.asn1.cmp.PKIFreeText freeText =
++                    new org.bouncycastle.asn1.cmp.PKIFreeText(text);
++            final PKIBody responseBody;
++            if (responseType == PKIBody.TYPE_ERROR) {
++                responseBody = new PKIBody(
++                        responseType,
++                        new org.bouncycastle.asn1.cmp.PKIStatusInfo(
++                                PKIStatus.rejection, freeText, null));
++            } else {
++                final CertResponse rejected = new CertResponse(
++                        new ASN1Integer(BigInteger.ZERO),
++                        new PKIStatusInfo(
++                                PKIStatus.rejection,
++                                freeText,
++                                null));
++                responseBody = new PKIBody(
++                        responseType, new CertRepMessage(null, new CertResponse[] {rejected}));
++            }
++            return PkiMessageGenerator.generateUnprotectMessage(
++                            PkiMessageGenerator.buildRespondingHeaderProvider(request), responseBody)
++                    .getEncoded();
++        }
++
+         private byte[] processCrmf(
+                 final PKIMessage request, final String certProfile,
+                 final PersistencyContext persistencyContext) throws Exception {
+-- 
+2.39.5
+
