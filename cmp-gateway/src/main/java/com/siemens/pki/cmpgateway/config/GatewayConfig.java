@@ -185,6 +185,17 @@ public class GatewayConfig implements Configuration {
                     + "upstream protection-certificate path validation will be skipped");
             return Collections.emptyList();
         }
+        java.io.File tsFile = new java.io.File(truststorePath);
+        if (!tsFile.isFile()) {
+            // Fail loudly: a missing truststore file usually means a typo in
+            // auth.truststore.path or that the file was never exported. Without it,
+            // signature-protected upstream messages cannot be validated against trust.
+            LOG.warn("truststore file '" + tsFile.getAbsolutePath()
+                    + "' does not exist; upstream protection-certificate path validation "
+                    + "will be skipped. Fix auth.truststore.path or leave it empty to skip intentionally.");
+            cachedTrustedCertificates = Collections.emptyList();
+            return cachedTrustedCertificates;
+        }
         try {
             KeyStore ts = loadTrustStore();
             if (ts == null) {
